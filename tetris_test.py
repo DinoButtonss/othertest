@@ -2,18 +2,15 @@
 tetris_test.py  --  main loop (camera -> vision -> AI -> solenoids)
 
     python3 tetris_test.py                          # live camera, solenoids OFF (LED timings) by default
-    python3 tetris_test.py --solenoids              # real solenoid timings
+    python3 tetris_test.py --solenoids              # real solenoid timings (28% boost duty cycle)
+    python3 tetris_test.py --solenoids --boost-duty 31
+                                                    # stronger boost voltage for stiffer D-pad presses
     python3 tetris_test.py --record                 # also save RAW camera frames (no overlay) to raw_*.avi
     python3 tetris_test.py --source video --video raw_20261115_101500.avi --no-hw --headless
                                                     # replay a recording through the exact same pipeline
 
 Keys (live window):  q quit | k re-run grid auto-align | b learn EMPTY-board background | g toggle grid
-                     r toggle raw recording | + / - / a focus | t test the hardware sequence
-
-Pipeline per frame
-    BoardReader (4-corner warp, exact 10x20 grid)  ->  SpawnTracker (exact tetromino match)
-    NextReader  ->  NextTracker (votes, and only trusted after it matches real spawns)
-    spawn event -> AI (tetris_ai_v2, 1-piece search unless NEXT is trusted) -> ActionSequencer -> hardware
+                     r toggle raw recording | + / - / a focus | t test the 4 active solenoids
 """
 import argparse
 import json
@@ -27,6 +24,7 @@ import numpy as np
 from tetris_shapes import SHAPES, rotate_piece
 from tetris_vision import (BOARD_COLS, BOARD_ROWS, SNES_SPAWN, BoardReader, CameraSource, NextReader,
                            NextTracker, SpawnTracker, VideoSource, load_calibration, refine_corners)
+
 
 class PrintOnlyController:
     """Never touches hardware - just prints the button presses (replay / --no-hw)."""
@@ -42,9 +40,10 @@ class PrintOnlyController:
 
 
 try:
-    from hardware_controller import HardwareController
+    from hardware_controller import HardwareController, DEFAULT_BOOST_DUTY_PCT
 except ImportError:
     HardwareController = None
+    DEFAULT_BOOST_DUTY_PCT = 28.0
 
 
 # --------------------------------------------------------------------------- AI selection
@@ -84,8 +83,7 @@ def trim_matrix(m):
     return [[r[c] for c in cols] for r in rows]
 
 
-# Leftmost column of the piece on the SNES 10-wide board AFTER rotating `r` times CW from SNES spawn
-# (copied unchanged from your original tetris_test.py):
+# Leftmost column of the piece on the SNES 10-wide board AFTER rotating `r` times CW from SNES spawn:
 SNES_SPAWN_LEFT_COL_BY_CW_CLICKS = {
     'I': {0: 3, 1: 5, 2: 3, 3: 5},
     'O': {0: 4, 1: 4, 2: 4, 3: 4},
@@ -98,9 +96,8 @@ SNES_SPAWN_LEFT_COL_BY_CW_CLICKS = {
 
 
 class ActionSequencer:
-    """Turns (piece, AI rotation index, target left column) into button presses.
-    Same tables as before, plus: if vision SAW the piece spawn one column away from the table
-    value (e.g. it had already started moving), all columns are shifted by that difference."""
+    """Turns (piece, AI rotation index, target left column) into solenoid button presses
+    WITHOUT 'DROP' so the piece falls naturally after rotating and shifting."""
 
     def __init__(self):
         self.spawn_mats = {name: mat for name, (mat, _) in SNES_SPAWN.items()}
@@ -137,15 +134,15 @@ class ActionSequencer:
             seq.append('ROTATE_CCW')
         dx = target_col - spawn_col
         seq += (['RIGHT'] * dx) if dx > 0 else (['LEFT'] * (-dx))
-        seq.append('DROP')
+        # NOTE: 'DROP' is intentionally omitted so the Down D-Pad solenoid is never used
         return seq
 
 
 # --------------------------------------------------------------------------- the bot
 class Bot:
     ALIGN_AFTER = 5          # run the one-time grid fine-alignment after this many spawns ...
-    ALIGN_MIN_STACK = 12     # ... and only once the stack has at least this many cells (enough blocks to align on)
-    ALIGN_FRAMES = 5         # number of newest spawn frames used (5/5 tested best; 2-4 can mis-align)
+    ALIGN_MIN_STACK = 12     # ... and only once the stack has at least this many cells
+    ALIGN_FRAMES = 5         # number of newest spawn frames used
 
     def __init__(self, cal, hw, ai_name='v2', use_next='auto', next_wait=0.45, log_path=None, verbose=True,
                  autoalign=True, sync_align=False):
@@ -180,7 +177,6 @@ class Bot:
             return self.ntrk.stable
         return self.ntrk.stable if self.ntrk.trusted else None      # auto
 
-    # ---- one-time fine alignment of the grid (see refine_corners in tetris_vision.py) -------------
     def _align_worker(self, frames):
         new, c0, c1 = refine_corners(self.board_corners, frames, rounds=3)
         shift = float(np.abs(new - self.board_corners).max())
@@ -249,9 +245,10 @@ class Bot:
         else:
             rot, col = move
             seq = self.seq.get_full_sequence(ev.piece, rot, col, observed_spawn_col=ev.left_col)
+            seq_str = " -> ".join(seq) if seq else "(HOLD SPAWN COLUMN - NO BUTTONS NEEDED)"
             if self.verbose:
                 print("t=%.1f  piece=%s next=%s (NEXT trusted=%s acc=%s)  move=%s  AI %.1f ms\n   %s" % (
-                    t, ev.piece, nxt, self.ntrk.trusted, self.ntrk.accuracy(), move, ms, " -> ".join(seq)))
+                    t, ev.piece, nxt, self.ntrk.trusted, self.ntrk.accuracy(), move, ms, seq_str))
             self.hw.dispatch_sequence(seq)
         rec = {"t": round(t, 2), "piece": ev.piece, "spawn_col": ev.left_col, "next_used": nxt,
                "next_expected_before_spawn": expected, "next_trusted": self.ntrk.trusted,
@@ -295,7 +292,8 @@ def draw_debug(frame, bot, obs, nmask, fps, show_grid, recording):
              "last piece %s | NEXT stable=%s trusted=%s acc=%s" % (
                  ev.piece if ev else "-", bot.ntrk.stable, bot.ntrk.trusted, bot.ntrk.accuracy())]
     if bot.last_decision:
-        lines.append("do: " + " ".join(bot.last_decision["seq"]))
+        seq_txt = " ".join(bot.last_decision["seq"]) if bot.last_decision["seq"] else "(STAY)"
+        lines.append("do: " + seq_txt)
     for i, l in enumerate(lines):
         cv2.putText(vis, l, (8, 20 + 20 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
     return vis
@@ -311,6 +309,8 @@ def parse_args():
     ap.add_argument("--camera-index", type=int, default=0)
     ap.add_argument("--size", default="1280x720", help="camera capture size; must match calibrate.py")
     ap.add_argument("--solenoids", action="store_true", help="use real solenoid timings (default: LED timings)")
+    ap.add_argument("--boost-duty", type=float, default=DEFAULT_BOOST_DUTY_PCT,
+                    help="boost converter PWM duty cycle %% (default: 28%%, max: 35%%)")
     ap.add_argument("--no-hw", action="store_true", help="never touch hardware (print button presses)")
     ap.add_argument("--ai", choices=["v2", "legacy"], default="v2")
     ap.add_argument("--use-next", choices=["auto", "on", "off"], default="auto",
@@ -346,7 +346,7 @@ def main():
         print("\n*** WARNING: hardware_controller.py not found - button presses will only be PRINTED. ***\n")
         hw = PrintOnlyController()
     else:
-        hw = HardwareController(use_solenoid_timings=args.solenoids)
+        hw = HardwareController(use_solenoid_timings=args.solenoids, boost_duty_pct=args.boost_duty)
     bot = Bot(cal, hw, ai_name=args.ai, use_next=args.use_next, log_path=args.log,
               autoalign=not args.no_autoalign, sync_align=(args.source == "video"))
 
@@ -419,7 +419,7 @@ def main():
                 elif k == ord('a') and args.source == "camera":
                     src.autofocus()
                 elif k == ord('t'):
-                    hw.dispatch_sequence(['LEFT', 'RIGHT', 'ROTATE_CW', 'DROP'])
+                    hw.dispatch_sequence(['LEFT', 'RIGHT', 'ROTATE_CW', 'ROTATE_CCW'])
     finally:
         if writer is not None:
             writer.release()
