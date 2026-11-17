@@ -19,7 +19,7 @@ except ImportError:
 
 
 # --- PIN MAPPING (BCM Numbering) ---
-# Boost Converter PWM Signal -> BCM GPIO 18 (Physical Pin 12) = Arduino Pin 10 (analogWrite 77)
+# Boost Converter PWM Signal -> BCM GPIO 18 (Physical Pin 12) = Arduino Pin 10
 BOOST_PWM_PIN = 18
 
 # Solenoid Control Pins -> BCM GPIO (Physical Pins 11, 13, 15, 16, 18) = Arduino Pins 2..6
@@ -31,38 +31,44 @@ BUTTON_PINS = {
     "DROP": 24,        # Physical Pin 18 (Arduino sol5 = Pin 6 -> DISABLED for safety!)
 }
 
-# Set to False so 'DROP' (Down D-Pad) is NEVER actuated by the solenoids
+# Keep False so 'DROP' (Down D-Pad) is never actuated by the solenoids
 ENABLE_DROP_SOLENOID = False
 
-# --- EXACT ARDUINO TIMER1 BOOST CONVERTER EQUIVALENT ---
-# Arduino: 16MHz / 512 = 31,250 Hz -> Period = 32,000 ns
-# Arduino: analogWrite(10, 77) -> 77 / 512 = 15.04% duty cycle -> 4,812 ns
+# --- BOOST CONVERTER HARDWARE PWM CONFIGURATION ---
+# 31,250 Hz -> Period = 32,000 nanoseconds
+# Note: Standard 8-bit Arduino analogWrite(10, 77) is 77 / 255 = 30.2% duty cycle (9,663 ns)!
+# Previously we only ran at 15.0% (4,812 ns), which gave half the boost voltage!
 PWM_PERIOD_NS = 32000
-PWM_DUTY_NS = 4812     # 15.0% duty cycle (NEVER exceed 25% on open-loop boost converter!)
+DEFAULT_BOOST_DUTY_PCT = 28.0  # 28% duty cycle (~8,960 ns) for hard D-pad strikes!
+MAX_SAFE_DUTY_PCT = 35.0       # Safety ceiling to protect MOSFET Q1 & capacitor C2
 
 # --- TIMING CONFIGURATION (Seconds) ---
 # Mode 1: LED Placeholder Timings
 LED_MODE_TIMINGS = {
-    "press_s": 0.18,
+    "dpad_press_s": 0.20,
+    "rot_press_s": 0.20,
     "release_s": 0.10,
-    "drop_hold_s": 0.30,
+    "drop_hold_s": 0.35,
 }
 
-# Mode 2: Real Solenoid Timings
-# 55ms strike time + 90ms capacitor recharge delay between consecutive strikes
+# Mode 2: High-Force Solenoid Timings
+# D-Pad (LEFT/RIGHT) gets a longer 85ms full-saturation strike + 130ms capacitor recharge
 SOLENOID_MODE_TIMINGS = {
-    "press_s": 0.055,      # 55ms crisp mechanical strike
-    "release_s": 0.090,    # 90ms spring return + C2 boost capacitor recharge time!
-    "drop_hold_s": 0.18,
+    "dpad_press_s": 0.085,  # 85ms hard strike for stiff SNES D-Pad (LEFT / RIGHT)
+    "rot_press_s": 0.060,   # 60ms crisp strike for A / B face buttons (ROTATE_CW / CCW)
+    "release_s": 0.130,     # 130ms pause so C2 recharges to 100% voltage before the next strike!
+    "drop_hold_s": 0.180,
 }
 
 
 class HardwareBoostPWM:
-    """Drives BCM GPIO 18 (Physical Pin 12) using Linux hardware PWM at 31.25 kHz (15% duty)."""
-    def __init__(self, period_ns=PWM_PERIOD_NS, duty_ns=PWM_DUTY_NS):
+    """Drives BCM GPIO 18 (Physical Pin 12) using Linux hardware PWM at 31.25 kHz."""
+    def __init__(self, period_ns=PWM_PERIOD_NS, duty_pct=DEFAULT_BOOST_DUTY_PCT):
         self.pwm_dir = None
-        self.period_ns = period_ns
-        self.duty_ns = duty_ns
+        self.period_ns = int(period_ns)
+        safe_pct = max(5.0, min(float(duty_pct), MAX_SAFE_DUTY_PCT))
+        self.duty_pct = safe_pct
+        self.duty_ns = int(round(self.period_ns * (safe_pct / 100.0)))
         self._setup_hardware_pwm()
 
     def _setup_hardware_pwm(self):
@@ -88,7 +94,10 @@ class HardwareBoostPWM:
         self._write_sysfs(f"{self.pwm_dir}/period", str(self.period_ns))
         self._write_sysfs(f"{self.pwm_dir}/duty_cycle", str(self.duty_ns))
         self._write_sysfs(f"{self.pwm_dir}/enable", "1")
-        print("⚡ Boost Converter PWM ONLINE on BCM GPIO 18 (31.25 kHz, 15.0% duty = Arduino 77)!")
+        print(
+            f"⚡ HIGH-POWER Boost PWM ONLINE on GPIO 18 "
+            f"(31.25 kHz, {self.duty_pct:.1f}% duty = {self.duty_ns} ns)!"
+        )
 
     def _write_sysfs(self, path, value):
         try:
@@ -108,9 +117,9 @@ class HardwareBoostPWM:
 
 
 class HardwareController:
-    def __init__(self, use_solenoid_timings=False):
+    def __init__(self, use_solenoid_timings=False, boost_duty_pct=DEFAULT_BOOST_DUTY_PCT):
         self.use_solenoids = use_solenoid_timings
-        self.timings = SOLENOID_MODE_TIMINGS if use_solenoid_timings else LED_MODE_TIMINGS
+        self.timings = dict(SOLENOID_MODE_TIMINGS if use_solenoid_timings else LED_MODE_TIMINGS)
         self.cmd_queue = queue.Queue()
         self.running = True
         self.devices = {}
@@ -130,16 +139,16 @@ class HardwareController:
         else:
             print(f"💻 GPIO library not found — running in MOCK mode (BCM Pins: {BUTTON_PINS})")
 
-        # 2. If running with real solenoids, start the 31.25 kHz Boost Converter PWM on GPIO 18!
+        # 2. Start 31.25 kHz Boost Converter PWM on GPIO 18 when using solenoids
         if self.use_solenoids and GPIO_BACKEND != "MOCK":
             try:
-                self.boost_pwm = HardwareBoostPWM()
-                print("🔋 Pre-charging boost capacitor C2 for 0.5s...")
-                time.sleep(0.5)
+                self.boost_pwm = HardwareBoostPWM(duty_pct=boost_duty_pct)
+                print("🔋 Pre-charging boost capacitor C2 for 0.7s to reach peak voltage...")
+                time.sleep(0.7)
             except Exception as e:
                 print(f"⚠️ Could not start HardwareBoostPWM on GPIO 18: {e}")
 
-        # 3. Start non-blocking background worker thread so camera FPS never drops
+        # 3. Start non-blocking background worker thread
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
 
@@ -159,12 +168,11 @@ class HardwareController:
     def dispatch_sequence(self, actions):
         """
         Queues a list of AI actions in exact order (e.g. ['ROTATE_CW', 'LEFT', 'LEFT'])
-        while automatically stripping out 'DROP' so pieces fall naturally!
+        while automatically stripping out 'DROP' so pieces fall naturally.
         """
         if not actions:
             return
 
-        # Filter out 'DROP' unless explicitly re-enabled
         filtered_actions = [
             a for a in actions
             if (a in BUTTON_PINS and (a != "DROP" or ENABLE_DROP_SOLENOID))
@@ -195,7 +203,12 @@ class HardwareController:
                 if action == "DROP" and not ENABLE_DROP_SOLENOID:
                     continue
 
-                hold_time = self.timings["drop_hold_s"] if action == "DROP" else self.timings["press_s"]
+                if action in ("LEFT", "RIGHT"):
+                    hold_time = self.timings["dpad_press_s"]
+                elif action == "DROP":
+                    hold_time = self.timings["drop_hold_s"]
+                else:
+                    hold_time = self.timings["rot_press_s"]
 
                 self._set_pin(action, True)
                 time.sleep(hold_time)
@@ -218,35 +231,33 @@ class HardwareController:
 
 
 # --- STANDALONE SOLENOID + BOOST CONVERTER TESTER ---
-# Run `python3 hardware_controller.py --solenoids` to test your 4 active solenoids + Boost PWM!
+# Run: `python3 hardware_controller.py --solenoids`
+# Or tune force: `python3 hardware_controller.py --solenoids --boost-duty 30`
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--solenoids", action="store_true", help="Enable 31.25kHz Boost PWM on GPIO 18 + solenoid timings")
-    ap.add_argument("--arduino-loop", action="store_true", help="Run Smarika's exact 1s pair-test loop")
+    ap.add_argument("--solenoids", action="store_true", help="Enable 31.25kHz Boost PWM + high-force solenoid timings")
+    ap.add_argument("--boost-duty", type=float, default=DEFAULT_BOOST_DUTY_PCT,
+                    help=f"Boost PWM duty cycle %% (default: {DEFAULT_BOOST_DUTY_PCT}%%, max: {MAX_SAFE_DUTY_PCT}%%)")
+    ap.add_argument("--dpad-ms", type=float, default=None, help="Override D-pad strike duration in ms (e.g. 95)")
     args = ap.parse_args()
 
-    ctrl = HardwareController(use_solenoid_timings=args.solenoids)
-    try:
-        if args.arduino_loop:
-            print("\n🔄 Running Smarika's Arduino Solenoid Test Loop (Ctrl+C to stop)...")
-            print("   Note: Firing 1-by-1 with 60ms strikes so solenoids don't overheat!")
-            while True:
-                for move in ["LEFT", "RIGHT", "ROTATE_CW", "ROTATE_CCW"]:
-                    print(f"  -> Striking {move} (BCM GPIO {BUTTON_PINS[move]})")
-                    ctrl.dispatch_sequence([move])
-                    time.sleep(0.8)
-        else:
-            print("\n🔧 Testing the 4 Active Solenoids in Order (DROP is disabled):")
-            active_moves = ["LEFT", "RIGHT", "ROTATE_CW", "ROTATE_CCW"]
-            for move in active_moves:
-                print(f"  -> Striking {move} (BCM GPIO {BUTTON_PINS[move]})")
-                ctrl.dispatch_sequence([move])
-                time.sleep(0.6)
+    ctrl = HardwareController(use_solenoid_timings=args.solenoids, boost_duty_pct=args.boost_duty)
+    if args.dpad_ms is not None:
+        ctrl.timings["dpad_press_s"] = args.dpad_ms / 1000.0
+        print(f"🔨 Overrode D-Pad strike time to {args.dpad_ms:.0f} ms")
 
-            print("\n🎮 Simulating AI Sequence: ['ROTATE_CW', 'LEFT', 'LEFT', 'DROP'] (DROP will be ignored!)")
-            ctrl.dispatch_sequence(["ROTATE_CW", "LEFT", "LEFT", "DROP"])
-            time.sleep(1.5)
-            print("✅ Hardware Test Complete!")
+    try:
+        print("\n🔧 Testing the 4 Active Solenoids in Order (DROP is disabled):")
+        active_moves = ["LEFT", "RIGHT", "ROTATE_CW", "ROTATE_CCW"]
+        for move in active_moves:
+            print(f"  -> Striking {move} (BCM GPIO {BUTTON_PINS[move]})")
+            ctrl.dispatch_sequence([move])
+            time.sleep(0.7)
+
+        print("\n🎮 Simulating Multi-Tap D-Pad Sequence: ['ROTATE_CW', 'LEFT', 'LEFT', 'LEFT']")
+        ctrl.dispatch_sequence(["ROTATE_CW", "LEFT", "LEFT", "LEFT"])
+        time.sleep(2.0)
+        print("✅ Hardware Test Complete!")
     except KeyboardInterrupt:
         print("\n🛑 Stopped by user.")
     finally:
