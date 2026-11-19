@@ -29,10 +29,11 @@ BUTTON_PINS = {
 }
 
 ENABLE_DROP_SOLENOID = False
+ENABLE_BOOST_PWM = False  # OFF while running directly on the 12V power supply!
 
-# --- BOOST CONVERTER PWM PRESETS ---
+# --- BOOST CONVERTER PWM PRESETS (kept for tetris_test.py import compatibility) ---
 ARDUINO_490HZ_PERIOD_NS = 2040816
-ARDUINO_490HZ_DUTY_PCT = 45.0      # Boosted to 45% duty for stronger solenoid strikes
+ARDUINO_490HZ_DUTY_PCT = 45.0
 
 FAST_31KHZ_PERIOD_NS = 32000
 FAST_31KHZ_DUTY_PCT = 15.0
@@ -49,13 +50,12 @@ LED_MODE_TIMINGS = {
     "drop_hold_s": 0.35,
 }
 
-# Tuned so consecutive strikes on the same solenoid (e.g. double ROTATE_CW) give
-# boost capacitor C2 extra recharge time and let the plunger/button fully reset.
+# Tuned for direct 12V supply: firm strikes + fast enough to finish 7-press moves before pieces land
 SOLENOID_MODE_TIMINGS = {
-    "dpad_press_s": 0.070,             # 70ms strike
-    "rot_press_s": 0.065,              # 65ms strike for A / B buttons
-    "release_s": 0.240,                # 240ms base recharge window between presses
-    "consecutive_same_extra_s": 0.140, # +140ms extra recharge when repeating the SAME button
+    "dpad_press_s": 0.080,             # 80ms firm strike for D-pad
+    "rot_press_s": 0.075,              # 75ms firm strike for A / B buttons
+    "release_s": 0.120,                # 120ms reset between different buttons
+    "consecutive_same_extra_s": 0.040, # +40ms (160ms total) for repeated same-button hits
     "drop_hold_s": 0.180,
 }
 
@@ -90,7 +90,6 @@ class HardwareBoostPWM:
             self._write_sysfs(f"{chip_path}/export", "0")
             time.sleep(0.1)
 
-        # Reset duty_cycle to 0 before changing period so kernel sysfs never rejects the write
         self._write_sysfs(f"{self.pwm_dir}/enable", "0")
         try:
             self._write_sysfs(f"{self.pwm_dir}/duty_cycle", "0")
@@ -99,7 +98,6 @@ class HardwareBoostPWM:
         self._write_sysfs(f"{self.pwm_dir}/period", str(self.period_ns))
         self._write_sysfs(f"{self.pwm_dir}/enable", "1")
 
-        # Soft-start ramp to protect Q1 and C2 from an inrush spike at 45% duty
         if soft_start and self.duty_pct > 25.0:
             ramp_steps = [p for p in (20.0, 30.0, 38.0) if p < self.duty_pct] + [self.duty_pct]
             for pct in ramp_steps:
@@ -157,13 +155,16 @@ class HardwareController:
         else:
             print(f"💻 GPIO library not found — running in MOCK mode (BCM Pins: {BUTTON_PINS})")
 
-        if self.use_solenoids and GPIO_BACKEND != "MOCK":
+        # Only start Boost PWM if ENABLE_BOOST_PWM is True (disabled for direct 12V supply)
+        if self.use_solenoids and ENABLE_BOOST_PWM and GPIO_BACKEND != "MOCK":
             try:
                 self.boost_pwm = HardwareBoostPWM(freq_hz=boost_freq_hz, duty_pct=boost_duty_pct)
                 print("🔋 Pre-charging boost capacitor C2 for 1.0s to reach full voltage...")
                 time.sleep(1.0)
             except Exception as e:
                 print(f"⚠️ Could not start HardwareBoostPWM on GPIO 18: {e}")
+        elif self.use_solenoids:
+            print("🔌 Direct 12V mode: Boost PWM on GPIO 18 is OFF.")
 
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
@@ -229,7 +230,7 @@ class HardwareController:
                 next_action = sequence[idx + 1] if idx + 1 < len(sequence) else None
                 wait_time = self.timings["release_s"]
                 if next_action == action:
-                    wait_time += self.timings.get("consecutive_same_extra_s", 0.140)
+                    wait_time += self.timings.get("consecutive_same_extra_s", 0.040)
                 time.sleep(wait_time)
 
             self.cmd_queue.task_done()
@@ -249,15 +250,15 @@ class HardwareController:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--solenoids", action="store_true", help="Enable Boost PWM + solenoid timings")
+    ap.add_argument("--solenoids", action="store_true", help="Enable solenoid timings")
     ap.add_argument("--freq", type=float, default=490.0,
-                    help="Boost PWM frequency in Hz (490 = standard Arduino analogWrite, 31250 = Timer1)")
+                    help="Boost PWM frequency in Hz (only used if ENABLE_BOOST_PWM=True)")
     ap.add_argument("--boost-duty", type=float, default=DEFAULT_BOOST_DUTY_PCT,
-                    help="Boost PWM duty cycle %% (default: 45.0%%, max: 45.0%%)")
+                    help="Boost PWM duty cycle %% (only used if ENABLE_BOOST_PWM=True)")
     ap.add_argument("--strike-ms", type=float, default=None,
                     help="Override solenoid ON strike duration in ms (e.g. 80)")
     ap.add_argument("--recharge-ms", type=float, default=None,
-                    help="Override capacitor recharge delay between strikes in ms (e.g. 300)")
+                    help="Override delay between strikes in ms (e.g. 120)")
     args = ap.parse_args()
 
     ctrl = HardwareController(
@@ -272,15 +273,15 @@ if __name__ == "__main__":
         ctrl.timings["release_s"] = args.recharge_ms / 1000.0
 
     try:
-        print("\n🔧 Testing the 4 Active Solenoids at 45% Boost Duty (1.0s recharge between each):")
+        print("\n🔧 Testing the 4 Active Solenoids on 12V:")
         for move in ["LEFT", "RIGHT", "ROTATE_CW", "ROTATE_CCW"]:
             print(f"  -> Striking {move} (BCM GPIO {BUTTON_PINS[move]})")
             ctrl.dispatch_sequence([move])
-            time.sleep(1.0)
+            time.sleep(0.6)
 
         print("\n🎮 Simulating Double CW Rotation + Shifts: ['ROTATE_CW', 'ROTATE_CW', 'LEFT', 'LEFT']")
         ctrl.dispatch_sequence(["ROTATE_CW", "ROTATE_CW", "LEFT", "LEFT"])
-        time.sleep(2.5)
+        time.sleep(1.5)
         print("✅ Hardware Test Complete!")
     except KeyboardInterrupt:
         print("\n🛑 Stopped by user.")
