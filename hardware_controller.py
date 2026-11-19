@@ -131,6 +131,12 @@ class HardwareController:
         self.timings = dict(SOLENOID_MODE_TIMINGS if use_solenoid_timings else LED_MODE_TIMINGS)
         self.cmd_queue = queue.Queue()
         self.running = True
+        # --- generation counter: a new dispatch / cancel() invalidates any sequence still running,
+        #     so presses meant for a piece that has already landed can never hit the NEXT piece.
+        self._gen = 0
+        self._gen_lock = threading.Lock()
+        self.last_exec = None          # {"start","end","presses","planned","aborted"} of the latest sequence
+        self._executing = False
         self.devices = {}
         self.boost_pwm = None
 
@@ -174,6 +180,48 @@ class HardwareController:
         elif GPIO_BACKEND == "RPIGPIO":
             GPIO.output(BUTTON_PINS[action], GPIO.HIGH if state else GPIO.LOW)
 
+    def _clear_queue(self):
+        while not self.cmd_queue.empty():
+            try:
+                self.cmd_queue.get_nowait()
+                self.cmd_queue.task_done()
+            except queue.Empty:
+                break
+
+    def cancel(self):
+        """Abort the sequence that is running (after the press in progress) and drop anything queued.
+        Call this the moment a piece has landed / a new piece spawned."""
+        with self._gen_lock:
+            self._gen += 1
+        self._clear_queue()
+
+    def is_busy(self):
+        return self._executing or not self.cmd_queue.empty()
+
+    def press_period(self, action="LEFT"):
+        """Seconds from one press start to the next press start (strike + recharge)."""
+        if action in ("LEFT", "RIGHT"):
+            hold = self.timings["dpad_press_s"]
+        elif action == "DROP":
+            hold = self.timings["drop_hold_s"]
+        else:
+            hold = self.timings["rot_press_s"]
+        return hold + self.timings["release_s"]
+
+    def strike_time(self, action="LEFT"):
+        if action in ("LEFT", "RIGHT"):
+            return self.timings["dpad_press_s"]
+        if action == "DROP":
+            return self.timings["drop_hold_s"]
+        return self.timings["rot_press_s"]
+
+    def estimate_duration(self, actions):
+        """Seconds until the LAST press of `actions` has been struck (its recharge is not needed)."""
+        acts = [a for a in actions if a in BUTTON_PINS and (a != "DROP" or ENABLE_DROP_SOLENOID)]
+        if not acts:
+            return 0.0
+        return sum(self.press_period(a) for a in acts[:-1]) + self.strike_time(acts[-1])
+
     def dispatch_sequence(self, actions):
         if not actions:
             return
@@ -185,24 +233,28 @@ class HardwareController:
         if not filtered_actions:
             return
 
-        while not self.cmd_queue.empty():
-            try:
-                self.cmd_queue.get_nowait()
-                self.cmd_queue.task_done()
-            except queue.Empty:
-                break
-
-        self.cmd_queue.put(filtered_actions)
+        with self._gen_lock:
+            self._gen += 1                  # invalidates a sequence that is still running
+            gen = self._gen
+        self._clear_queue()
+        self.cmd_queue.put((gen, filtered_actions))
 
     def _worker_loop(self):
         while self.running:
             try:
-                sequence = self.cmd_queue.get(timeout=0.1)
+                gen, sequence = self.cmd_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
+            self._executing = True
+            t_start = time.time()
+            done = 0
+            aborted = False
             for action in sequence:
                 if not self.running:
+                    break
+                if gen != self._gen:            # superseded by a newer decision or cancel(): stop pressing
+                    aborted = True
                     break
                 if action == "DROP" and not ENABLE_DROP_SOLENOID:
                     continue
@@ -217,8 +269,12 @@ class HardwareController:
                 self._set_pin(action, True)
                 time.sleep(hold_time)
                 self._set_pin(action, False)
-                time.sleep(self.timings["release_s"])
+                done += 1
+                time.sleep(self.timings["release_s"])   # recharge window is never cut short
 
+            self.last_exec = {"start": t_start, "end": time.time(), "presses": done,
+                              "planned": len(sequence), "aborted": aborted}
+            self._executing = False
             self.cmd_queue.task_done()
 
     def cleanup(self):

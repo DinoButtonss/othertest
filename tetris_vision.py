@@ -140,32 +140,112 @@ class BoardObservation:
 
 
 class BoardReader:
-    """Warps the playfield to an exact grid and decides which cells hold a block."""
+    """Warps the playfield to an exact grid and decides which cells hold a block.
 
-    def __init__(self, corners, cell=32, v_thr=140, cover_thr=0.85, margin=0.2, sat_min=90):
+    ADAPTIVE (adaptive=True, default): nothing is tied to one colour or one brightness.
+      bg_v   per-cell brightness of the EMPTY background, learned continuously from cells that are
+             quiet (no block, no neighbour lit) - follows room light, glare haze, exposure drift.
+      ref_v  brightness of the blocks currently on the board (dim / dark-palette levels read lower).
+      lit    = brighter than the midpoint between background and blocks
+      colour = the lit pixels must be colourful (saturation >= sat_min, itself scaled to the blocks'
+               own saturation), which rejects white text and white glare.
+    No hue is ever used, so purple / orange / any palette works as long as blocks are clearly
+    brighter than the background.  With default lighting the midpoint is ~140, same as before.
+    """
+
+    def __init__(self, corners, cell=32, v_thr=140, cover_thr=0.85, margin=0.2, sat_min=90, adaptive=True):
         self.cell = cell
         self.warper = Warper(corners, BOARD_COLS * cell, BOARD_ROWS * cell)
         self.v_thr = float(v_thr)
         self.cover_thr = cover_thr
-        self.sat_min = sat_min
+        self.sat_min_default = float(sat_min)
+        self.sat_min = float(sat_min)
         self.m = max(1, int(round(cell * margin)))
+        self.adaptive = adaptive
+        self.bg_v = np.full((BOARD_ROWS, BOARD_COLS), 60.0, dtype=np.float32)
+        self.bg_init = False
+        self.ref_v = 220.0
+        self.sat_ref = 200.0
         self.thr_map = np.full((BOARD_ROWS, BOARD_COLS), self.v_thr, dtype=np.float32)
+        self.health = {"bg": 60.0, "ref": 220.0, "contrast": 160.0, "sat_min": self.sat_min}
 
-    # --- optional: learn the background of an EMPTY board (key 'b') so bezel glare at the
-    # edges can never be mistaken for blocks.
+    # --- optional manual override (key 'b'): learn the background of an EMPTY board right now.
     def learn_empty(self, frames):
         p95 = np.zeros((BOARD_ROWS, BOARD_COLS), dtype=np.float32)
         for fr in frames:
-            v = self._v4(self.warper(fr))
-            cur = np.percentile(v, 95, axis=(1, 3))
+            v4 = self._v4(self.warper(fr))
+            cur = np.percentile(v4.transpose(0, 2, 1, 3).reshape(BOARD_ROWS, BOARD_COLS, -1), 95, axis=2)
             p95 = np.maximum(p95, cur)
-        self.thr_map = np.clip(p95 + 55.0, 110.0, 200.0).astype(np.float32)
+        self.bg_v = p95.astype(np.float32)
+        self.bg_init = True
+        self._update_thr()
 
     def _v4(self, warp):
         v = cv2.cvtColor(warp, cv2.COLOR_BGR2HSV)[:, :, 2]
         c, m = self.cell, self.m
-        v4 = v.reshape(BOARD_ROWS, c, BOARD_COLS, c)[:, m:c - m, :, m:c - m]
-        return v4
+        return v.reshape(BOARD_ROWS, c, BOARD_COLS, c)[:, m:c - m, :, m:c - m]
+
+    def _bg_smooth(self):
+        """Glare and haze are SMOOTH over many cells; a bezel edge or a reflection on one cell is not.
+        So a cell's background may not be much brighter than the median of its 5x5 neighbourhood."""
+        nb = cv2.medianBlur(self.bg_v.astype(np.float32), 5)
+        return np.minimum(self.bg_v, nb + 25.0)
+
+    def _update_thr(self):
+        bg = self._bg_smooth()
+        thr = bg + 0.55 * (self.ref_v - bg)
+        thr = np.clip(thr, np.maximum(bg + 35.0, 55.0), 200.0)
+        # Near normal lighting use exactly the threshold that was tuned on real footage; the adaptive
+        # value only takes over when conditions genuinely differ (dim, hazy, glare, other palette).
+        thr = np.where(np.abs(thr - self.v_thr) <= 12.0, self.v_thr, thr)
+        self.thr_map = thr.astype(np.float32)
+
+    def _adapt(self, v4, s4, cover, sat, grid, banner, std_v):
+        if banner:
+            return
+        p95 = np.percentile(v4.transpose(0, 2, 1, 3).reshape(BOARD_ROWS, BOARD_COLS, -1), 95, axis=2)
+
+        # Glare / haze: bright but colourless and smooth.  It is background, so absorb it quickly
+        # (a block is never colourless).  This is what keeps a hot spot on the glass from being read
+        # as blocks or as a WAIT/LOSE banner.
+        glare = (sat < 70) & (p95 > 100) & (std_v < 45)
+        # ... and only where it is a smooth AREA (>= 4 of the 3x3 neighbourhood agree), not a lone bright cell
+        crowd = cv2.boxFilter(glare.astype(np.float32), -1, (3, 3), normalize=False, borderType=cv2.BORDER_CONSTANT)
+        glare &= crowd >= 4
+        if glare.any():
+            self.bg_v[glare] = 0.6 * self.bg_v[glare] + 0.4 * p95[glare]
+
+        near = cv2.dilate((cover >= 0.3).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        quiet = (cover < 0.03) & ~near & ~glare & (p95 < 0.55 * self.ref_v + 20.0)
+        if quiet.any():
+            if not self.bg_init:
+                self.bg_v[:] = float(np.median(p95[quiet]))
+                self.bg_v[quiet] = p95[quiet]
+                self.bg_init = True
+            else:
+                self.bg_v[quiet] = 0.97 * self.bg_v[quiet] + 0.03 * p95[quiet]
+
+        bg = float(np.median(self._bg_smooth()))
+        if int(grid.sum()) >= 4:
+            vmean = v4.mean(axis=(1, 3))
+            ref_now = float(np.percentile(vmean[grid], 25))
+            self.ref_v = float(np.clip(0.9 * self.ref_v + 0.1 * ref_now, 100.0, 255.0))
+            self.sat_ref = 0.9 * self.sat_ref + 0.1 * float(np.median(sat[grid]))
+            self.sat_min = float(np.clip(0.45 * self.sat_ref, 45.0, self.sat_min_default))
+        else:
+            # Nothing is detected as a block yet (very dim / dark palette?).  If something clearly
+            # brighter than the background and colourful exists, let the block level come DOWN to it.
+            # saturation measured at each cell's brightest pixels (not just at 'lit' pixels, of which
+            # there may be none yet when the picture is very dim)
+            peak_mask = v4 >= (p95[:, None, :, None] - 5.0)
+            sat_peak = (s4 * peak_mask).sum(axis=(1, 3)) / np.maximum(peak_mask.sum(axis=(1, 3)), 1)
+            colourful = (sat_peak >= 0.45 * self.sat_ref) & ~glare
+            if colourful.any():
+                peak = float(np.percentile(p95[colourful], 99))
+                if peak - bg > 40.0 and peak < self.ref_v - 25.0:
+                    self.ref_v = float(np.clip(0.9 * self.ref_v + 0.1 * peak, 60.0, 255.0))
+        self._update_thr()
+        self.health = {"bg": bg, "ref": self.ref_v, "contrast": self.ref_v - bg, "sat_min": self.sat_min}
 
     def read(self, frame):
         warp = self.warper(frame)
@@ -177,16 +257,20 @@ class BoardReader:
         thr = self.thr_map[:, None, :, None]
         lit = v4 > thr
         cover = lit.mean(axis=(1, 3))
-        # mean saturation of the LIT pixels: real blocks are strongly coloured (S ~ 200),
-        # white text such as WAIT / LOSE / PAUSE and bezel glare are not (S ~ 20).
+        # mean saturation of the LIT pixels: real blocks are strongly coloured,
+        # white text such as WAIT / LOSE / PAUSE and white glare are not.
         n_lit = np.maximum(lit.sum(axis=(1, 3)), 1)
         sat = (s4 * lit).sum(axis=(1, 3)) / n_lit
         bright = cover >= self.cover_thr
         grid = bright & (sat >= self.sat_min)
 
-        # Banner = several bright-but-colourless cells away from the bezel columns.
-        text_like = (cover >= 0.35) & (sat < 60)
+        # Banner text (WAIT / LOSE / PAUSE) = several colourless cells with PARTIAL coverage and sharp
+        # strokes (high brightness variance inside the cell).  A glare spot is smooth, so it is not text.
+        std_v = v4.std(axis=(1, 3))
+        text_like = (cover >= 0.2) & (cover <= 0.92) & (sat < 60) & (std_v >= 40)
         banner = int(text_like[3:17, 1:9].sum()) >= 4
+        if self.adaptive:
+            self._adapt(v4, s4, cover, sat, grid, banner, std_v)
         return BoardObservation(grid, cover.astype(np.float32), sat.astype(np.float32), self.sat_min, banner, warp)
 
 
@@ -239,7 +323,7 @@ def refine_corners(corners, frames, shift_px=7.0, rounds=3):
 
 
 # ----------------------------------------------------------------------------- spawn tracker
-def _match_spawn(cells):
+def _match_spawn(cells, max_r0=3):
     """cells: iterable of (r, c).  Returns (piece, left_col) if they are exactly a spawn shape."""
     cells = set(cells)
     if len(cells) not in (4,):
@@ -247,7 +331,7 @@ def _match_spawn(cells):
     r0 = min(r for r, _ in cells)
     c0 = min(c for _, c in cells)
     rel = {(r - r0, c - c0) for r, c in cells}
-    if r0 > 1:                      # spawns on row 0; may already be one row down when first seen
+    if r0 > max_r0:                 # spawns on row 0; at fast levels it can already be a few rows down when first seen
         return None
     for name, (mat, spawn_col) in SNES_SPAWN.items():
         tmpl = {(r, c) for r, row in enumerate(mat) for c, v in enumerate(row) if v}
@@ -259,6 +343,7 @@ def _match_spawn(cells):
 class SpawnEvent:
     def __init__(self, t, piece, left_col, stack, cells):
         self.t = t
+        self.t_first = t
         self.piece = piece
         self.left_col = left_col
         self.stack = stack            # bool (20,10): board WITHOUT the new piece
@@ -302,6 +387,9 @@ class SpawnTracker:
 
     # cover thresholds tried, strictest first, when looking for a freshly spawned piece
     SPAWN_LEVELS = (0.85, 0.65, 0.50, 0.30)
+    ZONE_ROWS = 4      # spawn area that must be empty before a spawn can be detected (rows 0..ZONE_ROWS-1)
+    NEW_ROWS = 6       # rows searched for the 4 new cells
+    MAX_R0 = 3         # highest row index the piece's top may be on when first seen
 
     def update(self, obs, t):
         """obs: BoardObservation.  Returns a SpawnEvent or None."""
@@ -321,7 +409,7 @@ class SpawnTracker:
             self.armed = True
 
         weakest = obs.cells(self.SPAWN_LEVELS[-1])
-        if not weakest[0:2, 2:8].any():                      # spawn area empty even at the loosest level
+        if not weakest[0:self.ZONE_ROWS, 2:8].any():                      # spawn area (top 4 rows) empty even at the loosest level
             self.recent.append(grid.copy())
             if self.empty_since is None:
                 self.empty_since = t
@@ -348,15 +436,23 @@ class SpawnTracker:
         for lvl in self.SPAWN_LEVELS:
             g = obs.cells(lvl)
             nc = np.zeros_like(grid)
-            nc[0:4, :] = g[0:4, :] & ~snap[0:4, :]
-            n = int(nc.sum())
-            if n == 4:
-                rs, cs = np.nonzero(nc)
-                m = _match_spawn(zip(rs.tolist(), cs.tolist()))
+            nc[0:self.NEW_ROWS, 2:8] = g[0:self.NEW_ROWS, 2:8] & ~snap[0:self.NEW_ROWS, 2:8]
+            # Only the spawn columns (2..7) are examined, and the tetromino is found as a connected
+            # component: stray lit cells elsewhere (bezel glare, reflections, text) cannot veto it.
+            n_lab, lab = cv2.connectedComponents(nc.astype(np.uint8), connectivity=4)
+            found = []
+            for j in range(1, n_lab):
+                comp = lab == j
+                if int(comp.sum()) != 4:
+                    continue
+                rs, cs = np.nonzero(comp)
+                m = _match_spawn(zip(rs.tolist(), cs.tolist()), self.MAX_R0)
                 if m is not None:
-                    match, new_cells, n_new = m, nc, n
-                    break
-            n_new = max(n_new, n)
+                    found.append((m, comp))
+            n_new = max(n_new, int(nc.sum()))
+            if len(found) == 1:
+                match, new_cells = found[0][0], found[0][1]
+                break
         if match is None:
             self.cand = None
             self.cand_frames = 0
@@ -389,7 +485,9 @@ class SpawnTracker:
             self.armed = False
             self.last_stack = voted
             rs, cs = np.nonzero(new_cells)
-            return SpawnEvent(t, match[0], match[1], voted, list(zip(rs.tolist(), cs.tolist())))
+            ev = SpawnEvent(t, match[0], match[1], voted, list(zip(rs.tolist(), cs.tolist())))
+            ev.t_first = self.cand_first_t           # when the piece was FIRST seen (before the confirm frames)
+            return ev
         return None
 
 
@@ -416,7 +514,11 @@ class NextReader:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         v = hsv[:, :, 2]
         bg = float(np.percentile(v, 25))
-        thr = max(120.0, bg + 70.0)
+        top = float(np.percentile(v, 98))
+        if top - bg < 40.0:                                  # nothing brighter than the background
+            self.last_mask = np.zeros_like(v)
+            return None, self.last_mask
+        thr = bg + 0.5 * (top - bg)                          # relative: works for dim / dark palettes
         mask = (v > thr).astype(np.uint8)
         mask[:2, :] = 0
         mask[-2:, :] = 0
@@ -467,44 +569,62 @@ class NextReader:
 
 
 class NextTracker:
-    """Votes NEXT readings over time and checks them against the pieces that really spawn."""
+    """Votes NEXT readings over time and checks them against the pieces that really spawn.
 
-    def __init__(self, vote_len=6, need=4, settle_s=0.12, trust_window=12, trust_min=0.75):
-        self.votes = deque(maxlen=vote_len)
+    Timing matters: the NEXT box changes in the SAME frame the new piece first appears.  So
+      * "what NEXT promised" is looked up from just BEFORE the piece was first seen (t_first - 0.12 s);
+      * votes taken after t_first already describe the NEW next piece and are kept, so the lookahead
+        is available almost immediately instead of after a fresh round of votes."""
+
+    def __init__(self, vote_len=6, need=4, post_need=3, trust_window=12, trust_min=0.75):
+        self.votes = deque(maxlen=24)            # (t, piece or None)
+        self.hist = deque(maxlen=300)            # (t, stable value at that time)
+        self.vote_len = vote_len
         self.need = need
-        self.settle_s = settle_s
+        self.post_need = post_need
+        self.since = None                        # t_first of the latest spawn
         self.stable = None
-        self.stable_before_spawn = None
-        self.spawn_t = -1e9
-        self.history = deque(maxlen=trust_window)      # did "expected current" match the real spawn?
+        self.history = deque(maxlen=trust_window)   # did "what NEXT promised" match the real spawn?
         self.trust_min = trust_min
 
-    def push(self, piece, t):
-        if t - self.spawn_t < self.settle_s:           # box may still show the old piece
-            return
-        self.votes.append(piece)
-        valid = [p for p in self.votes if p]
-        self.stable = None
-        if valid:
-            top = max(set(valid), key=valid.count)
-            if valid.count(top) >= self.need:
-                self.stable = top
+    def _stable(self):
+        if self.since is None:
+            recent = [p for _, p in list(self.votes)[-self.vote_len:] if p]
+            need = self.need
+        else:
+            recent = [p for t, p in self.votes if t >= self.since and p]
+            need = self.post_need
+        if recent:
+            top = max(set(recent), key=recent.count)
+            if recent.count(top) >= need:
+                return top
+        return None
 
-    def on_spawn(self, piece, t):
-        expected = self.stable
+    def push(self, piece, t):
+        self.votes.append((t, piece))
+        self.stable = self._stable()
+        self.hist.append((t, self.stable))
+
+    def on_spawn(self, piece, t, t_first=None):
+        t_first = t if t_first is None else t_first
+        ref = t_first - 0.12
+        expected = None
+        for ts, st in reversed(self.hist):
+            if ts <= ref:
+                expected = st
+                break
         if expected is not None:
             self.history.append(expected == piece)
-        self.spawn_t = t
-        self.votes.clear()
-        self.stable = None
+        self.since = t_first
+        self.stable = self._stable()
         return expected
 
     @property
     def trusted(self):
         """Lookahead is only used once the NEXT reader has PROVEN itself: at least 4 spawns where
-        the piece it showed before the spawn was the piece that really spawned, and >= 75 % over
-        the recent window.  Until then (or if it never produces a stable reading) the AI simply
-        searches one piece deep, which is safe."""
+        the piece it promised was the piece that really spawned, and >= 75 % over the recent
+        window.  Until then (or if it never produces a stable reading) the AI searches one piece
+        deep, which is safe."""
         if len(self.history) < 4:
             return False
         return (sum(self.history) / float(len(self.history))) >= self.trust_min

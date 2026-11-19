@@ -185,14 +185,25 @@ def _score_state(rows_after, landing_height, eroded, weights):
             + weights['wells'] * wells)
 
 
-def _enumerate(rows, name, weights, with_cost=False):
-    """All reachable (rot, col) placements for a piece with their evaluated results."""
+def _enumerate(rows, name, weights, with_cost=False, press_fn=None, budget=None):
+    """All reachable (rot, col) placements for a piece with their evaluated results.
+
+    press_fn(name, rot, col) -> number of button presses needed.
+    budget = {"spr": seconds per row, "elapsed": seconds since the piece appeared,
+              "press_period": s per press (strike + recharge), "strike": s, "lead": s, "margin": s}
+    With a budget, a placement is only allowed if its presses can FINISH before the piece lands
+    there:  (presses-1)*press_period + strike + lead  <=  landing_row*spr - elapsed - margin.
+    If nothing fits, the placements that need the fewest presses are kept (best effort)."""
     out = []
+    infeasible = []
     for rot, h, w, masks in PIECES[name]:
         for x in range(COLS - w + 1):
             r, sh = _drop(rows, masks, h, x)
             if r < 0:
                 continue
+            presses = None
+            if press_fn is not None:
+                presses = press_fn(name, rot, x)
             placed = _place(rows, r, sh)
             after, n = _clear(placed)
             eroded = 0
@@ -204,12 +215,27 @@ def _enumerate(rows, name, weights, with_cost=False):
             landing = (ROWS - (r + h - 1)) + (h - 1) / 2.0
             sc = _score_state(after, landing, eroded, weights)
             if with_cost:
-                sc += weights['move_cost'] * (abs(x - SPAWN_COL.get(name, 4)) + (rot if rot < 3 else 1))
-            out.append((sc, (rot, x), placed, after))
+                if presses is not None:
+                    sc += weights['move_cost'] * presses
+                else:
+                    sc += weights['move_cost'] * (abs(x - SPAWN_COL.get(name, 4)) + (rot if rot < 3 else 1))
+            item = (sc, (rot, x), placed, after)
+            if budget is not None and presses is not None:
+                need = max(0, presses - 1) * budget["press_period"] + (budget["strike"] if presses else 0.0) + budget["lead"]
+                avail = r * budget["spr"] - budget["elapsed"] - budget["margin"]
+                if need > avail:
+                    infeasible.append((presses, need - avail, item))
+                    continue
+            out.append(item)
+    if not out and infeasible:
+        infeasible.sort(key=lambda t: (t[1], t[0]))          # least overshoot, then fewest presses
+        best = infeasible[0][1]
+        out = [t[2] for t in infeasible if t[1] <= best + 0.15]
     return out
 
 
-def find_best_move(board, current_piece_name, next_piece_name=None, weights=None, beam_width=None):
+def find_best_move(board, current_piece_name, next_piece_name=None, weights=None, beam_width=None,
+                   press_fn=None, budget=None):
     """See module docstring. `weights` is accepted for API compatibility; pass a dict
     with the keys of W_DEFAULT to override, otherwise W_DEFAULT is used (the old
     GA 'DNA' dicts are ignored on purpose)."""
@@ -220,7 +246,7 @@ def find_best_move(board, current_piece_name, next_piece_name=None, weights=None
         w = weights
 
     rows = board_to_rows(board)
-    stage1 = _enumerate(rows, current_piece_name, w, with_cost=True)
+    stage1 = _enumerate(rows, current_piece_name, w, with_cost=True, press_fn=press_fn, budget=budget)
     if not stage1:
         return None, -999999, None
     stage1.sort(key=lambda t: t[0], reverse=True)
