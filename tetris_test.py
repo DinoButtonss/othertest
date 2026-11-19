@@ -1,6 +1,6 @@
 """
 tetris_test.py  --  main loop (camera -> vision -> AI -> solenoids)
-Includes zero-false-positive vision verification for rotation presses.
+Includes zero-false-positive vision verification for ALL buttons (ROTATE_CW, ROTATE_CCW, LEFT, RIGHT).
 """
 import argparse
 import json
@@ -140,7 +140,7 @@ class ActionSequencer:
         return ai_rot % 4
 
     def get_split_sequence(self, piece, ai_rot, target_col, observed_spawn_col=None):
-        """Returns (rot_seq, shift_seq, target_clicks) so rotations can be verified before shifting."""
+        """Returns (rot_seq, shift_seq, target_clicks) so rotations and shifts can both be verified."""
         clicks = self.real_cw_clicks(piece, ai_rot)
         if piece in ('I', 'S', 'Z'):
             clicks %= 2
@@ -177,9 +177,9 @@ class Bot:
     ALIGN_MIN_STACK = 12
     ALIGN_FRAMES = 5
 
-    ROT_SETTLE_S = 0.10      # wait after solenoid finishes before reading camera
-    ROT_TIMEOUT_S = 0.25     # max time to wait for a clean 4-cell read before giving up & shifting
-    ROT_CONFIRM_FRAMES = 2   # require 2 consecutive frames of the SAME wrong shape before retrying
+    SETTLE_S = 0.10          # wait after solenoids finish before reading camera
+    VERIFY_TIMEOUT_S = 0.22  # max time to wait for a clean 4-cell read before skipping retry
+    CONFIRM_FRAMES = 2       # require 2 consecutive frames of the SAME mismatch before retrying
 
     def __init__(self, cal, hw, ai_name='v2', use_next='auto', next_wait=0.45, log_path=None, verbose=True,
                  autoalign=True, sync_align=False, ccw_failsafe=False):
@@ -206,7 +206,7 @@ class Bot:
         self.last_decision = None
         self.n_pieces = 0
         self.mismatches = 0
-        self._rot_state = None
+        self._move_state = None
 
     def _next_for_ai(self):
         if self.use_next == 'off':
@@ -239,82 +239,132 @@ class Bot:
             print("auto-align: cost %.1f -> %.1f, max corner move %.1f px -> %s" % (
                 c0, c1, shift, "applied" if ok else "kept original grid"))
 
-    def _observe_active_rotation(self, obs, stack, piece):
-        """Returns the observed CW-click state (0..3) ONLY if there is an exact, unambiguous
-        4-cell connected falling piece matching a known orientation of `piece`. Otherwise None."""
+    def _observe_active_piece(self, obs, stack, piece):
+        """Returns (obs_clicks, obs_left_col) ONLY if there is an exact, unambiguous
+        4-cell connected falling piece matching a known orientation of `piece` in rows 0..14.
+        Otherwise returns (None, None)."""
         active = obs.grid & ~stack
-        # Only look at rows 0..14 so we don't confuse with bottom stack noise
         sub = active[:15, :]
         if int(sub.sum()) != 4:
-            return None
-        n_lab, lab = cv2.connectedComponents(sub.astype(np.uint8), connectivity=4)
+            return None, None
+        n_lab, _ = cv2.connectedComponents(sub.astype(np.uint8), connectivity=4)
         if n_lab != 2:  # must be a single 4-connected piece
-            return None
+            return None, None
         rs, cs = np.nonzero(sub)
         r0, c0 = int(rs.min()), int(cs.min())
         rel = frozenset((int(r - r0), int(c - c0)) for r, c in zip(rs, cs))
-        return SNES_ROT_SHAPES.get(piece, {}).get(rel, None)
+        clicks = SNES_ROT_SHAPES.get(piece, {}).get(rel, None)
+        if clicks is None:
+            return None, None
+        if piece in ('I', 'S', 'Z'):
+            clicks %= 2
+        return clicks, c0
 
-    def _update_rot_failsafe(self, obs, t):
-        """Strict zero-false-positive rotation verification state machine."""
-        st = self._rot_state
+    def _start_shift_phase(self, st, shift_seq):
+        if not shift_seq:
+            self._move_state = None
+            return
+        self.hw.dispatch_sequence(shift_seq)
+        st["phase"] = "WAIT_SHIFT"
+        st["done_t"] = None
+        st["verify_start_t"] = None
+        st["wrong_obs"] = None
+        st["wrong_count"] = 0
+
+    def _update_failsafe(self, obs, t):
+        """Zero-false-positive verification state machine for ROTATE + LEFT/RIGHT."""
+        st = self._move_state
         if st is None:
             return
 
         hw_busy = self.hw.is_busy() if hasattr(self.hw, "is_busy") else False
 
-        if st["phase"] == "WAIT_ROT":
+        # --- Wait for current solenoid burst to finish + screen settle ---
+        if st["phase"] in ("WAIT_ROT", "WAIT_SHIFT"):
             if hw_busy:
                 st["done_t"] = None
                 return
             if st["done_t"] is None:
                 st["done_t"] = t
-            if (t - st["done_t"]) >= self.ROT_SETTLE_S:
-                st["phase"] = "VERIFY_ROT"
+            if (t - st["done_t"]) >= self.SETTLE_S:
+                st["phase"] = "VERIFY_ROT" if st["phase"] == "WAIT_ROT" else "VERIFY_SHIFT"
                 st["verify_start_t"] = t
+                st["wrong_obs"] = None
+                st["wrong_count"] = 0
             return
 
-        if st["phase"] == "VERIFY_ROT":
-            obs_clicks = self._observe_active_rotation(obs, st["stack"], st["piece"])
-            target = st["target_clicks"]
-            if st["piece"] in ('I', 'S', 'Z') and obs_clicks is not None:
-                obs_clicks %= 2
+        obs_clicks, obs_col = self._observe_active_piece(obs, st["stack"], st["piece"])
 
-            # Case 1: Confirmed it rotated to the exact target -> send shifts immediately!
-            if obs_clicks == target:
-                if st["shift_seq"]:
-                    self.hw.dispatch_sequence(st["shift_seq"])
-                self._rot_state = None
+        # --- Stage 1: Verify Rotation ---
+        if st["phase"] == "VERIFY_ROT":
+            target_rot = st["target_clicks"]
+
+            if obs_clicks == target_rot:
+                # Rotation succeeded! Compute exact shifts from the ACTUAL observed column
+                dx = st["target_col"] - obs_col
+                exact_shifts = (['RIGHT'] * dx) if dx > 0 else (['LEFT'] * (-dx))
+                self._start_shift_phase(st, exact_shifts)
                 return
 
-            # Case 2: Positively see a DIFFERENT valid rotation state
-            if obs_clicks is not None and obs_clicks != target:
+            if obs_clicks is not None and obs_clicks != target_rot:
                 if st["wrong_obs"] == obs_clicks:
                     st["wrong_count"] += 1
                 else:
                     st["wrong_obs"] = obs_clicks
                     st["wrong_count"] = 1
 
-                if st["wrong_count"] >= self.ROT_CONFIRM_FRAMES:
+                if st["wrong_count"] >= self.CONFIRM_FRAMES:
                     mod = 2 if st["piece"] in ('I', 'S', 'Z') else 4
-                    delta = (target - obs_clicks) % mod
-                    # Always recover with ROTATE_CW (1x, 2x, or 3x if CCW missed!)
-                    retry_seq = ['ROTATE_CW'] * delta
+                    delta = (target_rot - obs_clicks) % mod
+                    retry_rot = ['ROTATE_CW'] * delta
                     if self.verbose:
                         print("   [ROT failsafe] %s at rot=%d (want %d) -> firing %s + shifts" % (
-                            st["piece"], obs_clicks, target, " -> ".join(retry_seq)))
-                    self.hw.dispatch_sequence(retry_seq + st["shift_seq"])
-                    self._rot_state = None
+                            st["piece"], obs_clicks, target_rot, " -> ".join(retry_rot)))
+                    # Fire recovery rotations + planned shifts, then verify final column!
+                    self._start_shift_phase(st, retry_rot + st["shift_seq"])
                     return
             else:
                 st["wrong_obs"] = None
                 st["wrong_count"] = 0
 
-            # Case 3: Timeout without a clean 2-frame mismatch -> DO NOT RETRY, just shift!
-            if (t - st["verify_start_t"]) >= self.ROT_TIMEOUT_S:
-                if st["shift_seq"]:
-                    self.hw.dispatch_sequence(st["shift_seq"])
-                self._rot_state = None
+            if (t - st["verify_start_t"]) >= self.VERIFY_TIMEOUT_S:
+                # Unclear camera frame -> DO NOT retry rotation, just proceed to shifts
+                self._start_shift_phase(st, st["shift_seq"])
+            return
+
+        # --- Stage 2: Verify Horizontal Column (LEFT / RIGHT) ---
+        if st["phase"] == "VERIFY_SHIFT":
+            target_col = st["target_col"]
+
+            if obs_col == target_col:
+                # Landed on the exact target column!
+                self._move_state = None
+                return
+
+            if obs_col is not None and obs_col != target_col:
+                if st["wrong_obs"] == obs_col:
+                    st["wrong_count"] += 1
+                else:
+                    st["wrong_obs"] = obs_col
+                    st["wrong_count"] = 1
+
+                if st["wrong_count"] >= self.CONFIRM_FRAMES:
+                    dx = target_col - obs_col
+                    retry_shift = (['RIGHT'] * dx) if dx > 0 else (['LEFT'] * (-dx))
+                    if self.verbose:
+                        print("   [SHIFT failsafe] %s at col=%d (want %d) -> firing %s" % (
+                            st["piece"], obs_col, target_col, " -> ".join(retry_shift)))
+                    self.hw.dispatch_sequence(retry_shift)
+                    # Max 1 shift retry per piece so it can never loop
+                    self._move_state = None
+                    return
+            else:
+                st["wrong_obs"] = None
+                st["wrong_count"] = 0
+
+            if (t - st["verify_start_t"]) >= self.VERIFY_TIMEOUT_S:
+                # Unclear camera frame -> DO NOT retry
+                self._move_state = None
 
     def process(self, frame, t):
         if self._align_result is not None:
@@ -322,11 +372,11 @@ class Bot:
         obs = self.reader.read(frame)
         nxt, nmask = self.nreader.read(frame)
         self.ntrk.push(nxt, t)
-        self._update_rot_failsafe(obs, t)
+        self._update_failsafe(obs, t)
 
         ev = self.tracker.update(obs, t)
         if ev is not None:
-            self._rot_state = None
+            self._move_state = None
             expected = self.ntrk.on_spawn(ev.piece, t)
             if expected is not None and expected != ev.piece:
                 self.mismatches += 1
@@ -370,22 +420,25 @@ class Bot:
                 print("t=%.1f  piece=%s next=%s (NEXT trusted=%s acc=%s)  move=%s  AI %.1f ms\n   %s" % (
                     t, ev.piece, nxt, self.ntrk.trusted, self.ntrk.accuracy(), move, ms, seq_str))
 
+            base_state = {
+                "piece": ev.piece,
+                "stack": ev.stack,
+                "target_clicks": target_clicks,
+                "target_col": col,
+                "shift_seq": shift_seq,
+                "done_t": None,
+                "verify_start_t": None,
+                "wrong_obs": None,
+                "wrong_count": 0,
+            }
             if rot_seq:
-                # Send ONLY rotations first, then verify on camera before sending shifts
                 self.hw.dispatch_sequence(rot_seq)
-                self._rot_state = {
-                    "phase": "WAIT_ROT",
-                    "piece": ev.piece,
-                    "stack": ev.stack,
-                    "target_clicks": target_clicks,
-                    "shift_seq": shift_seq,
-                    "done_t": None,
-                    "verify_start_t": None,
-                    "wrong_obs": None,
-                    "wrong_count": 0,
-                }
+                base_state["phase"] = "WAIT_ROT"
+                self._move_state = base_state
             elif shift_seq:
                 self.hw.dispatch_sequence(shift_seq)
+                base_state["phase"] = "WAIT_SHIFT"
+                self._move_state = base_state
 
         rec = {"t": round(t, 2), "piece": ev.piece, "spawn_col": ev.left_col, "next_used": nxt,
                "next_expected_before_spawn": expected, "next_trusted": self.ntrk.trusted,
