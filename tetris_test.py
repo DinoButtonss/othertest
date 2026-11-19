@@ -1,16 +1,5 @@
 """
 tetris_test.py  --  main loop (camera -> vision -> AI -> solenoids)
-
-    python3 tetris_test.py                          # live camera, solenoids OFF (LED timings) by default
-    python3 tetris_test.py --solenoids              # real solenoid timings (28% boost duty cycle)
-    python3 tetris_test.py --solenoids --boost-duty 31
-                                                    # stronger boost voltage for stiffer D-pad presses
-    python3 tetris_test.py --record                 # also save RAW camera frames (no overlay) to raw_*.avi
-    python3 tetris_test.py --source video --video raw_20261115_101500.avi --no-hw --headless
-                                                    # replay a recording through the exact same pipeline
-
-Keys (live window):  q quit | k re-run grid auto-align | b learn EMPTY-board background | g toggle grid
-                     r toggle raw recording | + / - / a focus | t test the 4 active solenoids
 """
 import argparse
 import json
@@ -43,14 +32,31 @@ try:
     from hardware_controller import HardwareController, DEFAULT_BOOST_DUTY_PCT
 except ImportError:
     HardwareController = None
-    DEFAULT_BOOST_DUTY_PCT = 28.0
+    DEFAULT_BOOST_DUTY_PCT = 30.2
 
 
 # --------------------------------------------------------------------------- AI selection
-CHAMPION_DNA = {'lines_1': -250.0, 'lines_2': -80.0, 'lines_3': 100.0, 'lines_4': 12000.0,
-                'height': 75.0, 'holes': 25000.0, 'bumpiness': 320.0, 'wells': 300.0}
-CLEANUP_DNA = {'lines_1': 900.0, 'lines_2': 2000.0, 'lines_3': 3500.0, 'lines_4': 12000.0,
-               'height': 140.0, 'holes': 20000.0, 'bumpiness': 240.0, 'wells': 60.0}
+# Strongly rewards 4-line clears (Tetris) over single-line clears.
+CHAMPION_DNA = {
+    'lines_1': -4500.0,
+    'lines_2': -1500.0,
+    'lines_3': 2000.0,
+    'lines_4': 45000.0,
+    'height': 85.0,
+    'holes': 25000.0,
+    'bumpiness': 320.0,
+    'wells': 950.0,
+}
+CLEANUP_DNA = {
+    'lines_1': 600.0,
+    'lines_2': 1800.0,
+    'lines_3': 4500.0,
+    'lines_4': 30000.0,
+    'height': 140.0,
+    'holes': 20000.0,
+    'bumpiness': 240.0,
+    'wells': 300.0,
+}
 
 
 def make_ai(name):
@@ -58,7 +64,7 @@ def make_ai(name):
     if name == 'legacy':
         from tetris_ai_search import find_best_move as legacy_find
 
-        def ai(board, piece, nxt, press_fn=None, budget=None):
+        def ai(board, piece, nxt):
             top = any(1 in r for r in board[:8])
             dna = CLEANUP_DNA if top else CHAMPION_DNA
             beam = 4 if any(1 in r for r in board[:10]) else 12
@@ -68,8 +74,8 @@ def make_ai(name):
 
     import tetris_ai_v2
 
-    def ai(board, piece, nxt, press_fn=None, budget=None):
-        mv, sc, _ = tetris_ai_v2.find_best_move(board, piece, nxt, press_fn=press_fn, budget=budget)
+    def ai(board, piece, nxt):
+        mv, sc, _ = tetris_ai_v2.find_best_move(board, piece, nxt)
         return mv, sc
     return ai
 
@@ -83,7 +89,6 @@ def trim_matrix(m):
     return [[r[c] for c in cols] for r in rows]
 
 
-# Leftmost column of the piece on the SNES 10-wide board AFTER rotating `r` times CW from SNES spawn:
 SNES_SPAWN_LEFT_COL_BY_CW_CLICKS = {
     'I': {0: 3, 1: 5, 2: 3, 3: 5},
     'O': {0: 4, 1: 4, 2: 4, 3: 4},
@@ -99,8 +104,9 @@ class ActionSequencer:
     """Turns (piece, AI rotation index, target left column) into solenoid button presses
     WITHOUT 'DROP' so the piece falls naturally after rotating and shifting."""
 
-    def __init__(self):
+    def __init__(self, ccw_failsafe=True):
         self.spawn_mats = {name: mat for name, (mat, _) in SNES_SPAWN.items()}
+        self.ccw_failsafe = ccw_failsafe
 
     def real_cw_clicks(self, piece, ai_rot):
         target = SHAPES[piece]
@@ -131,55 +137,24 @@ class ActionSequencer:
         elif clicks == 2:
             seq += ['ROTATE_CW', 'ROTATE_CW']
         elif clicks == 3:
-            seq.append('ROTATE_CCW')
+            if self.ccw_failsafe:
+                # Failsafe: rotate clockwise 3 times instead of relying on CCW
+                seq += ['ROTATE_CW', 'ROTATE_CW', 'ROTATE_CW']
+            else:
+                seq.append('ROTATE_CCW')
         dx = target_col - spawn_col
         seq += (['RIGHT'] * dx) if dx > 0 else (['LEFT'] * (-dx))
-        # NOTE: 'DROP' is intentionally omitted so the Down D-Pad solenoid is never used
         return seq
 
 
 # --------------------------------------------------------------------------- the bot
-class GravityEstimator:
-    """Measures how fast pieces fall (seconds per row) from the camera, so the bot can adapt to the
-    level.  The piece's top row is sampled every frame; each 1-3 row step gives one sample
-    (a bigger jump is a drop and is ignored).  Reset the piece with begin()."""
-
-    def __init__(self):
-        self.samples = deque(maxlen=9)
-        self.last = None            # (t, row) of the previous observation for this piece
-
-    @property
-    def sec_per_row(self):
-        if len(self.samples) < 2:
-            return None
-        s = sorted(self.samples)
-        return s[len(s) // 2]
-
-    def begin(self, t_first, row):
-        # the gravity counter starts when the piece appears, so the first step is a full period
-        self.last = (t_first, row) if row <= 1 else None
-
-    def observe(self, t, row):
-        if self.last is None:
-            self.last = (t, row)
-            return
-        t0, r0 = self.last
-        if row > r0:
-            d = row - r0
-            if 1 <= d <= 3 and t > t0:
-                self.samples.append((t - t0) / d)
-            self.last = (t, row)
-
-
 class Bot:
-    SLOW_SPR = 0.25          # slower than this (seconds per row) there is time to wait for the NEXT box
-    ALIGN_AFTER = 5          # run the one-time grid fine-alignment after this many spawns ...
-    ALIGN_MIN_STACK = 12     # ... and only once the stack has at least this many cells
-    ALIGN_FRAMES = 5         # number of newest spawn frames used
+    ALIGN_AFTER = 5
+    ALIGN_MIN_STACK = 12
+    ALIGN_FRAMES = 5
 
     def __init__(self, cal, hw, ai_name='v2', use_next='auto', next_wait=0.45, log_path=None, verbose=True,
-                 autoalign=True, sync_align=False, time_budget='auto', wall_clock=False, press_period=None,
-                 strike=None):
+                 autoalign=True, sync_align=False, ccw_failsafe=True):
         self.board_corners = np.array(cal["board_corners"], dtype=np.float32)
         self.reader = BoardReader(self.board_corners)
         self.autoalign = autoalign
@@ -192,7 +167,7 @@ class Bot:
         self.tracker = SpawnTracker()
         self.ntrk = NextTracker()
         self.ai = make_ai(ai_name)
-        self.seq = ActionSequencer()
+        self.seq = ActionSequencer(ccw_failsafe=ccw_failsafe)
         self.hw = hw
         self.use_next = use_next
         self.next_wait = next_wait
@@ -203,33 +178,15 @@ class Bot:
         self.last_decision = None
         self.n_pieces = 0
         self.mismatches = 0
-        self.time_budget = time_budget          # 'auto' | 'on' | 'off'
-        self.wall_clock = wall_clock            # True when frame timestamps are time.time() (live camera)
-        self.gravity = GravityEstimator()
-        self.cur_stack = None
-        self.cur_t_first = None
-        self.press_period = press_period
-        self.strike = strike
-        self.timing_log = []
-
-    def _hw_press_period(self):
-        if self.press_period is not None:
-            return self.press_period
-        f = getattr(self.hw, "press_period", None)
-        return float(f("LEFT")) if callable(f) else 0.285
-
-    def _hw_strike(self):
-        if self.strike is not None:
-            return self.strike
-        f = getattr(self.hw, "strike_time", None)
-        return float(f("LEFT")) if callable(f) else 0.065
+        # Runtime CCW verification watch: (sent_t, active_cells_tuple, remaining_shift_actions)
+        self._ccw_watch = None
 
     def _next_for_ai(self):
         if self.use_next == 'off':
             return None
         if self.use_next == 'on':
             return self.ntrk.stable
-        return self.ntrk.stable if self.ntrk.trusted else None      # auto
+        return self.ntrk.stable if self.ntrk.trusted else None
 
     def _align_worker(self, frames):
         new, c0, c1 = refine_corners(self.board_corners, frames, rounds=3)
@@ -249,12 +206,29 @@ class Bot:
         if ok:
             old = self.reader
             self.reader = BoardReader(new, cell=old.cell)
-            for name in ("thr_map", "bg_v", "bg_init", "ref_v", "sat_ref", "sat_min", "health"):
-                setattr(self.reader, name, getattr(old, name))      # keep what was learned about the lighting
+            self.reader.thr_map = old.thr_map
             self.board_corners = new
         if self.verbose:
             print("auto-align: cost %.1f -> %.1f, max corner move %.1f px -> %s" % (
                 c0, c1, shift, "applied" if ok else "kept original grid"))
+
+    def _check_ccw_failsafe(self, obs, t):
+        """If ROTATE_CCW was issued and the top-row piece pattern didn't change after ~0.22s,
+        fire ROTATE_CW x3 instead and re-send remaining horizontal moves."""
+        if self._ccw_watch is None:
+            return
+        sent_t, orig_cells, rem_shifts = self._ccw_watch
+        if t - sent_t < 0.22:
+            return
+        self._ccw_watch = None
+        stack = self.tracker.last_stack if self.tracker.last_stack is not None else np.zeros_like(obs.grid)
+        top_active = tuple(sorted(zip(*np.nonzero(obs.grid[0:4, :] & ~stack[0:4, :]))))
+        # If the piece hasn't rotated (same top-row shape/cells), recover with 3x CW
+        if top_active == orig_cells and len(orig_cells) == 4:
+            recovery = ['ROTATE_CW', 'ROTATE_CW', 'ROTATE_CW'] + rem_shifts
+            if self.verbose:
+                print("   [CCW failsafe] CCW did not register -> firing 3x ROTATE_CW: %s" % " -> ".join(recovery))
+            self.hw.dispatch_sequence(recovery)
 
     def process(self, frame, t):
         if self._align_result is not None:
@@ -262,25 +236,12 @@ class Bot:
         obs = self.reader.read(frame)
         nxt, nmask = self.nreader.read(frame)
         self.ntrk.push(nxt, t)
+        self._check_ccw_failsafe(obs, t)
 
         ev = self.tracker.update(obs, t)
-
-        # fall speed of the current piece (rows fall under gravity while the solenoids press)
-        if self.cur_stack is not None:
-            pc = obs.cells(0.5) & ~self.cur_stack
-            rs = np.nonzero(pc)[0]
-            if len(rs) >= 3:
-                self.gravity.observe(t, int(rs.min()))
-
         if ev is not None:
-            # a NEW piece exists, so the previous one has landed: any presses still queued for it are stale
-            cancel = getattr(self.hw, "cancel", None)
-            if callable(cancel):
-                cancel()
-            self.cur_stack = ev.stack.copy()
-            first_rows = np.nonzero(obs.cells(0.5) & ~self.cur_stack)[0]
-            self.gravity.begin(ev.t_first, int(first_rows.min()) if len(first_rows) else 0)
-            expected = self.ntrk.on_spawn(ev.piece, t, ev.t_first)
+            self._ccw_watch = None
+            expected = self.ntrk.on_spawn(ev.piece, t)
             if expected is not None and expected != ev.piece:
                 self.mismatches += 1
             self.pending = (ev, expected)
@@ -294,37 +255,20 @@ class Bot:
 
         decision = None
         if self.pending is not None:
-            spr = self.gravity.sec_per_row
-            fast = spr is not None and spr <= self.SLOW_SPR
-            # waiting for a fresh NEXT reading costs ~0.3-0.45 s: only worth it while pieces fall slowly
-            wait_for_next = (self.use_next != 'off' and (self.use_next == 'on' or self.ntrk.trusted)
-                             and not (fast and self.use_next != 'on'))
+            wait_for_next = self.use_next != 'off' and (self.use_next == 'on' or self.ntrk.trusted)
             ev, expected = self.pending
             if (not wait_for_next) or self.ntrk.stable is not None or (t - ev.t) >= self.next_wait:
-                decision = self._decide(ev, expected, t)
+                decision = self._decide(ev, expected, t, obs)
                 self.pending = None
         return obs, nmask, decision
 
-    def _decide(self, ev, expected, t):
-        spr = self.gravity.sec_per_row
-        fast = spr is not None and spr <= self.SLOW_SPR
-        nxt = None if (fast and self.use_next != 'on') else self._next_for_ai()
+    def _decide(self, ev, expected, t, obs):
+        nxt = self._next_for_ai()
         board = ev.stack.astype(int).tolist()
-
-        # time budget: only when pieces fall fast.  Placements whose button presses cannot finish
-        # before the piece lands are skipped (see tetris_ai_v2._enumerate).
-        budget = None
-        press_fn = None
-        if self.time_budget != 'off' and spr is not None and (fast or self.time_budget == 'on'):
-            budget = dict(spr=spr, elapsed=max(0.0, t - ev.t_first), press_period=self._hw_press_period(),
-                          strike=self._hw_strike(), lead=0.02, margin=-0.10)
-            press_fn = lambda name, rot, col: len(self.seq.get_full_sequence(
-                name, rot, col, observed_spawn_col=ev.left_col))
         t0 = time.perf_counter()
-        move, score = self.ai(board, ev.piece, nxt, press_fn=press_fn, budget=budget)
+        move, score = self.ai(board, ev.piece, nxt)
         ms = (time.perf_counter() - t0) * 1000.0
         self.n_pieces += 1
-        t_dispatch = time.time()
         if move is None:
             seq = []
             if self.verbose:
@@ -334,23 +278,18 @@ class Bot:
             seq = self.seq.get_full_sequence(ev.piece, rot, col, observed_spawn_col=ev.left_col)
             seq_str = " -> ".join(seq) if seq else "(HOLD SPAWN COLUMN - NO BUTTONS NEEDED)"
             if self.verbose:
-                print("t=%.1f  piece=%s next=%s (NEXT trusted=%s acc=%s)  move=%s  AI %.1f ms  fall=%s s/row%s\n   %s" % (
-                    t, ev.piece, nxt, self.ntrk.trusted, self.ntrk.accuracy(), move, ms,
-                    "?" if spr is None else "%.2f" % spr, "  [time-budgeted]" if budget else "", seq_str))
+                print("t=%.1f  piece=%s next=%s (NEXT trusted=%s acc=%s)  move=%s  AI %.1f ms\n   %s" % (
+                    t, ev.piece, nxt, self.ntrk.trusted, self.ntrk.accuracy(), move, ms, seq_str))
             self.hw.dispatch_sequence(seq)
-        est = getattr(self.hw, "estimate_duration", None)
-        planned = float(est(seq)) if callable(est) and seq else None
+            if 'ROTATE_CCW' in seq:
+                rem_shifts = [a for a in seq if a in ('LEFT', 'RIGHT')]
+                stack = self.tracker.last_stack if self.tracker.last_stack is not None else np.zeros_like(obs.grid)
+                top_active = tuple(sorted(zip(*np.nonzero(obs.grid[0:4, :] & ~stack[0:4, :]))))
+                self._ccw_watch = (t, top_active, rem_shifts)
         rec = {"t": round(t, 2), "piece": ev.piece, "spawn_col": ev.left_col, "next_used": nxt,
                "next_expected_before_spawn": expected, "next_trusted": self.ntrk.trusted,
                "move": list(move) if move else None, "seq": seq, "ai_ms": round(ms, 1),
-               "sec_per_row": None if spr is None else round(spr, 3), "time_budgeted": bool(budget),
-               "first_seen_to_decision_s": round(t - ev.t_first, 3),
-               "planned_press_s": None if planned is None else round(planned, 3),
-               "capture_to_dispatch_ms": round((t_dispatch - t) * 1000.0, 1) if self.wall_clock else None,
-               "vision_health": {k: round(float(v), 1) for k, v in self.reader.health.items()},
                "stack": ["".join("#" if v else "." for v in row) for row in ev.stack]}
-        if self.wall_clock:
-            rec["frame_age_ms"] = round((t_dispatch - t) * 1000.0, 1)      # camera frame -> button dispatch
         if self.log:
             self.log.write(json.dumps(rec) + "\n")
             self.log.flush()
@@ -388,11 +327,6 @@ def draw_debug(frame, bot, obs, nmask, fps, show_grid, recording):
              "banner" if obs.banner else "cells %d" % int(obs.grid.sum()),
              "last piece %s | NEXT stable=%s trusted=%s acc=%s" % (
                  ev.piece if ev else "-", bot.ntrk.stable, bot.ntrk.trusted, bot.ntrk.accuracy())]
-    spr = bot.gravity.sec_per_row
-    hl = bot.reader.health
-    lines.append("fall %s s/row | light: bg %.0f block %.0f contrast %.0f%s" % (
-        "?" if spr is None else "%.2f" % spr, hl["bg"], hl["ref"], hl["contrast"],
-        "  LOW CONTRAST" if hl["contrast"] < 70 else ""))
     if bot.last_decision:
         seq_txt = " ".join(bot.last_decision["seq"]) if bot.last_decision["seq"] else "(STAY)"
         lines.append("do: " + seq_txt)
@@ -412,19 +346,16 @@ def parse_args():
     ap.add_argument("--size", default="1280x720", help="camera capture size; must match calibrate.py")
     ap.add_argument("--solenoids", action="store_true", help="use real solenoid timings (default: LED timings)")
     ap.add_argument("--boost-duty", type=float, default=DEFAULT_BOOST_DUTY_PCT,
-                    help="boost converter PWM duty cycle %% (default: 28%%, max: 35%%)")
+                    help="boost converter PWM duty cycle %% (default: 30.2%%)")
     ap.add_argument("--no-hw", action="store_true", help="never touch hardware (print button presses)")
     ap.add_argument("--ai", choices=["v2", "legacy"], default="v2")
     ap.add_argument("--use-next", choices=["auto", "on", "off"], default="auto",
                     help="auto = use the NEXT box only after it has proven itself against real spawns")
+    ap.add_argument("--no-ccw-failsafe", action="store_true",
+                    help="allow direct ROTATE_CCW instead of defaulting 3-CW to 3x ROTATE_CW")
     ap.add_argument("--record", nargs="?", const="auto", default=None, help="save raw frames (no overlay)")
     ap.add_argument("--log", default="decisions.jsonl")
     ap.add_argument("--calibration", default=None, help="calibration file (default: calibration.json next to the scripts)")
-    ap.add_argument("--fps", type=int, default=30, help="camera frame rate (IMX708: up to ~56 at 2304x1296 binned mode)")
-    ap.add_argument("--time-budget", choices=["auto", "on", "off"], default="auto",
-                    help="auto = only when measured fall speed is fast (<= 0.25 s/row)")
-    ap.add_argument("--strike-ms", type=float, default=None, help="override solenoid strike time (ms)")
-    ap.add_argument("--recharge-ms", type=float, default=None, help="override recharge gap between presses (ms)")
     ap.add_argument("--no-autoalign", action="store_true", help="skip the one-time automatic grid fine-alignment")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--grid", action="store_true", help="draw the 10x20 grid on the live view")
@@ -439,7 +370,7 @@ def main():
         src = VideoSource(args.video, step=args.step, realtime=args.realtime)
     else:
         size = tuple(int(v) for v in args.size.lower().split("x"))
-        src = CameraSource(index=args.camera_index, size=size, fps=args.fps)
+        src = CameraSource(index=args.camera_index, size=size)
         time.sleep(0.5)
 
     frame_size = src.frame_size()
@@ -454,13 +385,9 @@ def main():
         hw = PrintOnlyController()
     else:
         hw = HardwareController(use_solenoid_timings=args.solenoids, boost_duty_pct=args.boost_duty)
-    if args.strike_ms is not None and hasattr(hw, "timings"):
-        hw.timings["dpad_press_s"] = hw.timings["rot_press_s"] = args.strike_ms / 1000.0
-    if args.recharge_ms is not None and hasattr(hw, "timings"):
-        hw.timings["release_s"] = args.recharge_ms / 1000.0
     bot = Bot(cal, hw, ai_name=args.ai, use_next=args.use_next, log_path=args.log,
               autoalign=not args.no_autoalign, sync_align=(args.source == "video"),
-              time_budget=args.time_budget, wall_clock=(args.source == "camera"))
+              ccw_failsafe=not args.no_ccw_failsafe)
 
     show_grid = args.grid
     writer = None
@@ -488,7 +415,7 @@ def main():
                     h, w = frame.shape[:2]
                     writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 30, (w, h))
                     print("recording raw frames to", path)
-                writer.write(frame)                       # RAW frame, before any drawing
+                writer.write(frame)
 
             if learn_frames is not None:
                 learn_frames.append(frame.copy())
@@ -543,7 +470,7 @@ def main():
         try:
             cv2.destroyAllWindows()
         except cv2.error:
-            pass                                     # headless OpenCV build
+            pass
         print("pieces handled: %d | NEXT-box mismatches: %d" % (bot.n_pieces, bot.mismatches))
 
 
