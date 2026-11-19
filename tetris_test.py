@@ -1,5 +1,6 @@
 """
 tetris_test.py  --  main loop (camera -> vision -> AI -> solenoids)
+Includes zero-false-positive vision verification for rotation presses.
 """
 import argparse
 import json
@@ -24,6 +25,9 @@ class PrintOnlyController:
     def dispatch_sequence(self, seq):
         print("   [no-hw] ", " -> ".join(seq))
 
+    def is_busy(self):
+        return False
+
     def cleanup(self):
         pass
 
@@ -32,11 +36,10 @@ try:
     from hardware_controller import HardwareController, DEFAULT_BOOST_DUTY_PCT
 except ImportError:
     HardwareController = None
-    DEFAULT_BOOST_DUTY_PCT = 30.2
+    DEFAULT_BOOST_DUTY_PCT = 45.0
 
 
 # --------------------------------------------------------------------------- AI selection
-# Strongly rewards 4-line clears (Tetris) over single-line clears.
 CHAMPION_DNA = {
     'lines_1': -4500.0,
     'lines_2': -1500.0,
@@ -60,7 +63,6 @@ CLEANUP_DNA = {
 
 
 def make_ai(name):
-    """Returns f(board_rows_of_ints, piece, next_piece_or_None) -> ((rot, col), score) or (None, score)"""
     if name == 'legacy':
         from tetris_ai_search import find_best_move as legacy_find
 
@@ -89,6 +91,24 @@ def trim_matrix(m):
     return [[r[c] for c in cols] for r in rows]
 
 
+def _mat_to_rel(m):
+    t = trim_matrix(m)
+    return frozenset((r, c) for r, row in enumerate(t) for c, v in enumerate(row) if v)
+
+
+# Precompute normalized 4-cell shapes for every CW click state (0..3) of every piece
+SNES_ROT_SHAPES = {}
+for _name, (_mat, _) in SNES_SPAWN.items():
+    _cur = _mat
+    _states = {}
+    for _clicks in range(4):
+        _rel = _mat_to_rel(_cur)
+        if _rel not in _states:
+            _states[_rel] = _clicks
+        _cur = rotate_piece(_cur)
+    SNES_ROT_SHAPES[_name] = _states
+
+
 SNES_SPAWN_LEFT_COL_BY_CW_CLICKS = {
     'I': {0: 3, 1: 5, 2: 3, 3: 5},
     'O': {0: 4, 1: 4, 2: 4, 3: 4},
@@ -101,10 +121,9 @@ SNES_SPAWN_LEFT_COL_BY_CW_CLICKS = {
 
 
 class ActionSequencer:
-    """Turns (piece, AI rotation index, target left column) into solenoid button presses
-    WITHOUT 'DROP' so the piece falls naturally after rotating and shifting."""
+    """Turns (piece, AI rotation index, target left column) into solenoid button presses."""
 
-    def __init__(self, ccw_failsafe=True):
+    def __init__(self, ccw_failsafe=False):
         self.spawn_mats = {name: mat for name, (mat, _) in SNES_SPAWN.items()}
         self.ccw_failsafe = ccw_failsafe
 
@@ -120,7 +139,8 @@ class ActionSequencer:
             cur = rotate_piece(cur)
         return ai_rot % 4
 
-    def get_full_sequence(self, piece, ai_rot, target_col, observed_spawn_col=None):
+    def get_split_sequence(self, piece, ai_rot, target_col, observed_spawn_col=None):
+        """Returns (rot_seq, shift_seq, target_clicks) so rotations can be verified before shifting."""
         clicks = self.real_cw_clicks(piece, ai_rot)
         if piece in ('I', 'S', 'Z'):
             clicks %= 2
@@ -131,20 +151,24 @@ class ActionSequencer:
         if observed_spawn_col is not None:
             spawn_col += observed_spawn_col - table.get(0, 4)
 
-        seq = []
+        rot_seq = []
         if clicks == 1:
-            seq.append('ROTATE_CW')
+            rot_seq.append('ROTATE_CW')
         elif clicks == 2:
-            seq += ['ROTATE_CW', 'ROTATE_CW']
+            rot_seq += ['ROTATE_CW', 'ROTATE_CW']
         elif clicks == 3:
             if self.ccw_failsafe:
-                # Failsafe: rotate clockwise 3 times instead of relying on CCW
-                seq += ['ROTATE_CW', 'ROTATE_CW', 'ROTATE_CW']
+                rot_seq += ['ROTATE_CW', 'ROTATE_CW', 'ROTATE_CW']
             else:
-                seq.append('ROTATE_CCW')
+                rot_seq.append('ROTATE_CCW')
+
         dx = target_col - spawn_col
-        seq += (['RIGHT'] * dx) if dx > 0 else (['LEFT'] * (-dx))
-        return seq
+        shift_seq = (['RIGHT'] * dx) if dx > 0 else (['LEFT'] * (-dx))
+        return rot_seq, shift_seq, clicks
+
+    def get_full_sequence(self, piece, ai_rot, target_col, observed_spawn_col=None):
+        rot_seq, shift_seq, _ = self.get_split_sequence(piece, ai_rot, target_col, observed_spawn_col)
+        return rot_seq + shift_seq
 
 
 # --------------------------------------------------------------------------- the bot
@@ -153,8 +177,12 @@ class Bot:
     ALIGN_MIN_STACK = 12
     ALIGN_FRAMES = 5
 
+    ROT_SETTLE_S = 0.10      # wait after solenoid finishes before reading camera
+    ROT_TIMEOUT_S = 0.25     # max time to wait for a clean 4-cell read before giving up & shifting
+    ROT_CONFIRM_FRAMES = 2   # require 2 consecutive frames of the SAME wrong shape before retrying
+
     def __init__(self, cal, hw, ai_name='v2', use_next='auto', next_wait=0.45, log_path=None, verbose=True,
-                 autoalign=True, sync_align=False, ccw_failsafe=True):
+                 autoalign=True, sync_align=False, ccw_failsafe=False):
         self.board_corners = np.array(cal["board_corners"], dtype=np.float32)
         self.reader = BoardReader(self.board_corners)
         self.autoalign = autoalign
@@ -178,8 +206,7 @@ class Bot:
         self.last_decision = None
         self.n_pieces = 0
         self.mismatches = 0
-        # Runtime CCW verification watch: (sent_t, active_cells_tuple, remaining_shift_actions)
-        self._ccw_watch = None
+        self._rot_state = None
 
     def _next_for_ai(self):
         if self.use_next == 'off':
@@ -212,23 +239,82 @@ class Bot:
             print("auto-align: cost %.1f -> %.1f, max corner move %.1f px -> %s" % (
                 c0, c1, shift, "applied" if ok else "kept original grid"))
 
-    def _check_ccw_failsafe(self, obs, t):
-        """If ROTATE_CCW was issued and the top-row piece pattern didn't change after ~0.22s,
-        fire ROTATE_CW x3 instead and re-send remaining horizontal moves."""
-        if self._ccw_watch is None:
+    def _observe_active_rotation(self, obs, stack, piece):
+        """Returns the observed CW-click state (0..3) ONLY if there is an exact, unambiguous
+        4-cell connected falling piece matching a known orientation of `piece`. Otherwise None."""
+        active = obs.grid & ~stack
+        # Only look at rows 0..14 so we don't confuse with bottom stack noise
+        sub = active[:15, :]
+        if int(sub.sum()) != 4:
+            return None
+        n_lab, lab = cv2.connectedComponents(sub.astype(np.uint8), connectivity=4)
+        if n_lab != 2:  # must be a single 4-connected piece
+            return None
+        rs, cs = np.nonzero(sub)
+        r0, c0 = int(rs.min()), int(cs.min())
+        rel = frozenset((int(r - r0), int(c - c0)) for r, c in zip(rs, cs))
+        return SNES_ROT_SHAPES.get(piece, {}).get(rel, None)
+
+    def _update_rot_failsafe(self, obs, t):
+        """Strict zero-false-positive rotation verification state machine."""
+        st = self._rot_state
+        if st is None:
             return
-        sent_t, orig_cells, rem_shifts = self._ccw_watch
-        if t - sent_t < 0.22:
+
+        hw_busy = self.hw.is_busy() if hasattr(self.hw, "is_busy") else False
+
+        if st["phase"] == "WAIT_ROT":
+            if hw_busy:
+                st["done_t"] = None
+                return
+            if st["done_t"] is None:
+                st["done_t"] = t
+            if (t - st["done_t"]) >= self.ROT_SETTLE_S:
+                st["phase"] = "VERIFY_ROT"
+                st["verify_start_t"] = t
             return
-        self._ccw_watch = None
-        stack = self.tracker.last_stack if self.tracker.last_stack is not None else np.zeros_like(obs.grid)
-        top_active = tuple(sorted(zip(*np.nonzero(obs.grid[0:4, :] & ~stack[0:4, :]))))
-        # If the piece hasn't rotated (same top-row shape/cells), recover with 3x CW
-        if top_active == orig_cells and len(orig_cells) == 4:
-            recovery = ['ROTATE_CW', 'ROTATE_CW', 'ROTATE_CW'] + rem_shifts
-            if self.verbose:
-                print("   [CCW failsafe] CCW did not register -> firing 3x ROTATE_CW: %s" % " -> ".join(recovery))
-            self.hw.dispatch_sequence(recovery)
+
+        if st["phase"] == "VERIFY_ROT":
+            obs_clicks = self._observe_active_rotation(obs, st["stack"], st["piece"])
+            target = st["target_clicks"]
+            if st["piece"] in ('I', 'S', 'Z') and obs_clicks is not None:
+                obs_clicks %= 2
+
+            # Case 1: Confirmed it rotated to the exact target -> send shifts immediately!
+            if obs_clicks == target:
+                if st["shift_seq"]:
+                    self.hw.dispatch_sequence(st["shift_seq"])
+                self._rot_state = None
+                return
+
+            # Case 2: Positively see a DIFFERENT valid rotation state
+            if obs_clicks is not None and obs_clicks != target:
+                if st["wrong_obs"] == obs_clicks:
+                    st["wrong_count"] += 1
+                else:
+                    st["wrong_obs"] = obs_clicks
+                    st["wrong_count"] = 1
+
+                if st["wrong_count"] >= self.ROT_CONFIRM_FRAMES:
+                    mod = 2 if st["piece"] in ('I', 'S', 'Z') else 4
+                    delta = (target - obs_clicks) % mod
+                    # Always recover with ROTATE_CW (1x, 2x, or 3x if CCW missed!)
+                    retry_seq = ['ROTATE_CW'] * delta
+                    if self.verbose:
+                        print("   [ROT failsafe] %s at rot=%d (want %d) -> firing %s + shifts" % (
+                            st["piece"], obs_clicks, target, " -> ".join(retry_seq)))
+                    self.hw.dispatch_sequence(retry_seq + st["shift_seq"])
+                    self._rot_state = None
+                    return
+            else:
+                st["wrong_obs"] = None
+                st["wrong_count"] = 0
+
+            # Case 3: Timeout without a clean 2-frame mismatch -> DO NOT RETRY, just shift!
+            if (t - st["verify_start_t"]) >= self.ROT_TIMEOUT_S:
+                if st["shift_seq"]:
+                    self.hw.dispatch_sequence(st["shift_seq"])
+                self._rot_state = None
 
     def process(self, frame, t):
         if self._align_result is not None:
@@ -236,11 +322,11 @@ class Bot:
         obs = self.reader.read(frame)
         nxt, nmask = self.nreader.read(frame)
         self.ntrk.push(nxt, t)
-        self._check_ccw_failsafe(obs, t)
+        self._update_rot_failsafe(obs, t)
 
         ev = self.tracker.update(obs, t)
         if ev is not None:
-            self._ccw_watch = None
+            self._rot_state = None
             expected = self.ntrk.on_spawn(ev.piece, t)
             if expected is not None and expected != ev.piece:
                 self.mismatches += 1
@@ -258,11 +344,11 @@ class Bot:
             wait_for_next = self.use_next != 'off' and (self.use_next == 'on' or self.ntrk.trusted)
             ev, expected = self.pending
             if (not wait_for_next) or self.ntrk.stable is not None or (t - ev.t) >= self.next_wait:
-                decision = self._decide(ev, expected, t, obs)
+                decision = self._decide(ev, expected, t)
                 self.pending = None
         return obs, nmask, decision
 
-    def _decide(self, ev, expected, t, obs):
+    def _decide(self, ev, expected, t):
         nxt = self._next_for_ai()
         board = ev.stack.astype(int).tolist()
         t0 = time.perf_counter()
@@ -275,17 +361,32 @@ class Bot:
                 print("t=%.1f  %s: NO LEGAL MOVE (board full?)" % (t, ev.piece))
         else:
             rot, col = move
-            seq = self.seq.get_full_sequence(ev.piece, rot, col, observed_spawn_col=ev.left_col)
+            rot_seq, shift_seq, target_clicks = self.seq.get_split_sequence(
+                ev.piece, rot, col, observed_spawn_col=ev.left_col
+            )
+            seq = rot_seq + shift_seq
             seq_str = " -> ".join(seq) if seq else "(HOLD SPAWN COLUMN - NO BUTTONS NEEDED)"
             if self.verbose:
                 print("t=%.1f  piece=%s next=%s (NEXT trusted=%s acc=%s)  move=%s  AI %.1f ms\n   %s" % (
                     t, ev.piece, nxt, self.ntrk.trusted, self.ntrk.accuracy(), move, ms, seq_str))
-            self.hw.dispatch_sequence(seq)
-            if 'ROTATE_CCW' in seq:
-                rem_shifts = [a for a in seq if a in ('LEFT', 'RIGHT')]
-                stack = self.tracker.last_stack if self.tracker.last_stack is not None else np.zeros_like(obs.grid)
-                top_active = tuple(sorted(zip(*np.nonzero(obs.grid[0:4, :] & ~stack[0:4, :]))))
-                self._ccw_watch = (t, top_active, rem_shifts)
+
+            if rot_seq:
+                # Send ONLY rotations first, then verify on camera before sending shifts
+                self.hw.dispatch_sequence(rot_seq)
+                self._rot_state = {
+                    "phase": "WAIT_ROT",
+                    "piece": ev.piece,
+                    "stack": ev.stack,
+                    "target_clicks": target_clicks,
+                    "shift_seq": shift_seq,
+                    "done_t": None,
+                    "verify_start_t": None,
+                    "wrong_obs": None,
+                    "wrong_count": 0,
+                }
+            elif shift_seq:
+                self.hw.dispatch_sequence(shift_seq)
+
         rec = {"t": round(t, 2), "piece": ev.piece, "spawn_col": ev.left_col, "next_used": nxt,
                "next_expected_before_spawn": expected, "next_trusted": self.ntrk.trusted,
                "move": list(move) if move else None, "seq": seq, "ai_ms": round(ms, 1),
@@ -346,13 +447,13 @@ def parse_args():
     ap.add_argument("--size", default="1280x720", help="camera capture size; must match calibrate.py")
     ap.add_argument("--solenoids", action="store_true", help="use real solenoid timings (default: LED timings)")
     ap.add_argument("--boost-duty", type=float, default=DEFAULT_BOOST_DUTY_PCT,
-                    help="boost converter PWM duty cycle %% (default: 30.2%%)")
+                    help="boost converter PWM duty cycle %%")
     ap.add_argument("--no-hw", action="store_true", help="never touch hardware (print button presses)")
     ap.add_argument("--ai", choices=["v2", "legacy"], default="v2")
     ap.add_argument("--use-next", choices=["auto", "on", "off"], default="auto",
                     help="auto = use the NEXT box only after it has proven itself against real spawns")
-    ap.add_argument("--no-ccw-failsafe", action="store_true",
-                    help="allow direct ROTATE_CCW instead of defaulting 3-CW to 3x ROTATE_CW")
+    ap.add_argument("--force-3cw", action="store_true",
+                    help="always use 3x ROTATE_CW instead of trying ROTATE_CCW first")
     ap.add_argument("--record", nargs="?", const="auto", default=None, help="save raw frames (no overlay)")
     ap.add_argument("--log", default="decisions.jsonl")
     ap.add_argument("--calibration", default=None, help="calibration file (default: calibration.json next to the scripts)")
@@ -387,7 +488,7 @@ def main():
         hw = HardwareController(use_solenoid_timings=args.solenoids, boost_duty_pct=args.boost_duty)
     bot = Bot(cal, hw, ai_name=args.ai, use_next=args.use_next, log_path=args.log,
               autoalign=not args.no_autoalign, sync_align=(args.source == "video"),
-              ccw_failsafe=not args.no_ccw_failsafe)
+              ccw_failsafe=args.force_3cw)
 
     show_grid = args.grid
     writer = None
