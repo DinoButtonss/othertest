@@ -32,12 +32,13 @@ ENABLE_DROP_SOLENOID = False
 
 # --- BOOST CONVERTER PWM PRESETS ---
 ARDUINO_490HZ_PERIOD_NS = 2040816
-ARDUINO_490HZ_DUTY_PCT = 30.2
+ARDUINO_490HZ_DUTY_PCT = 45.0      # Boosted to 45% duty for stronger solenoid strikes
 
 FAST_31KHZ_PERIOD_NS = 32000
 FAST_31KHZ_DUTY_PCT = 15.0
 
 MAX_SAFE_DUTY_PCT = 45.0
+DEFAULT_BOOST_DUTY_PCT = ARDUINO_490HZ_DUTY_PCT
 
 # --- TIMING CONFIGURATION (Seconds) ---
 LED_MODE_TIMINGS = {
@@ -51,9 +52,9 @@ LED_MODE_TIMINGS = {
 # Tuned so consecutive strikes on the same solenoid (e.g. double ROTATE_CW) give
 # boost capacitor C2 extra recharge time and let the plunger/button fully reset.
 SOLENOID_MODE_TIMINGS = {
-    "dpad_press_s": 0.070,            # 70ms strike
-    "rot_press_s": 0.065,             # 65ms strike for A / B buttons
-    "release_s": 0.240,               # 240ms base recharge window between presses
+    "dpad_press_s": 0.070,             # 70ms strike
+    "rot_press_s": 0.065,              # 65ms strike for A / B buttons
+    "release_s": 0.240,                # 240ms base recharge window between presses
     "consecutive_same_extra_s": 0.140, # +140ms extra recharge when repeating the SAME button
     "drop_hold_s": 0.180,
 }
@@ -61,16 +62,16 @@ SOLENOID_MODE_TIMINGS = {
 
 class HardwareBoostPWM:
     """Drives BCM GPIO 18 (Physical Pin 12) using Linux kernel hardware PWM."""
-    def __init__(self, freq_hz=490, duty_pct=ARDUINO_490HZ_DUTY_PCT):
+    def __init__(self, freq_hz=490, duty_pct=DEFAULT_BOOST_DUTY_PCT, soft_start=True):
         self.pwm_dir = None
         self.freq_hz = float(freq_hz)
         self.period_ns = int(round(1e9 / self.freq_hz))
         safe_pct = max(5.0, min(float(duty_pct), MAX_SAFE_DUTY_PCT))
         self.duty_pct = safe_pct
         self.duty_ns = int(round(self.period_ns * (safe_pct / 100.0)))
-        self._setup_hardware_pwm()
+        self._setup_hardware_pwm(soft_start=soft_start)
 
-    def _setup_hardware_pwm(self):
+    def _setup_hardware_pwm(self, soft_start=True):
         if not os.path.exists("/sys/class/pwm/pwmchip0"):
             print("🔧 Loading hardware PWM overlay on BCM GPIO 18 (Physical Pin 12)...")
             subprocess.run(["sudo", "dtoverlay", "pwm", "pin=18", "func=2"], check=False)
@@ -89,14 +90,25 @@ class HardwareBoostPWM:
             self._write_sysfs(f"{chip_path}/export", "0")
             time.sleep(0.1)
 
+        # Reset duty_cycle to 0 before changing period so kernel sysfs never rejects the write
         self._write_sysfs(f"{self.pwm_dir}/enable", "0")
         try:
             self._write_sysfs(f"{self.pwm_dir}/duty_cycle", "0")
         except Exception:
             pass
         self._write_sysfs(f"{self.pwm_dir}/period", str(self.period_ns))
-        self._write_sysfs(f"{self.pwm_dir}/duty_cycle", str(self.duty_ns))
         self._write_sysfs(f"{self.pwm_dir}/enable", "1")
+
+        # Soft-start ramp to protect Q1 and C2 from an inrush spike at 45% duty
+        if soft_start and self.duty_pct > 25.0:
+            ramp_steps = [p for p in (20.0, 30.0, 38.0) if p < self.duty_pct] + [self.duty_pct]
+            for pct in ramp_steps:
+                step_ns = int(round(self.period_ns * (pct / 100.0)))
+                self._write_sysfs(f"{self.pwm_dir}/duty_cycle", str(step_ns))
+                time.sleep(0.15)
+        else:
+            self._write_sysfs(f"{self.pwm_dir}/duty_cycle", str(self.duty_ns))
+
         print(
             f"⚡ Boost PWM ONLINE on GPIO 18 "
             f"({self.freq_hz:.0f} Hz, {self.duty_pct:.1f}% duty | period={self.period_ns}ns, duty={self.duty_ns}ns)!"
@@ -119,9 +131,6 @@ class HardwareBoostPWM:
                 print(f"⚠️ Error stopping PWM: {e}")
 
 
-DEFAULT_BOOST_DUTY_PCT = ARDUINO_490HZ_DUTY_PCT
-
-
 class HardwareController:
     def __init__(self, use_solenoid_timings=False, boost_duty_pct=None, boost_freq_hz=490):
         self.use_solenoids = use_solenoid_timings
@@ -133,7 +142,7 @@ class HardwareController:
         self.last_action = None
 
         if boost_duty_pct is None:
-            boost_duty_pct = ARDUINO_490HZ_DUTY_PCT if boost_freq_hz <= 2000 else FAST_31KHZ_DUTY_PCT
+            boost_duty_pct = DEFAULT_BOOST_DUTY_PCT if boost_freq_hz <= 2000 else FAST_31KHZ_DUTY_PCT
 
         if GPIO_BACKEND == "GPIOZERO":
             for name, pin in BUTTON_PINS.items():
@@ -243,8 +252,8 @@ if __name__ == "__main__":
     ap.add_argument("--solenoids", action="store_true", help="Enable Boost PWM + solenoid timings")
     ap.add_argument("--freq", type=float, default=490.0,
                     help="Boost PWM frequency in Hz (490 = standard Arduino analogWrite, 31250 = Timer1)")
-    ap.add_argument("--boost-duty", type=float, default=None,
-                    help="Boost PWM duty cycle %% (default: 30.2%% at 490Hz, 15.0%% at 31250Hz)")
+    ap.add_argument("--boost-duty", type=float, default=DEFAULT_BOOST_DUTY_PCT,
+                    help="Boost PWM duty cycle %% (default: 45.0%%, max: 45.0%%)")
     ap.add_argument("--strike-ms", type=float, default=None,
                     help="Override solenoid ON strike duration in ms (e.g. 80)")
     ap.add_argument("--recharge-ms", type=float, default=None,
@@ -263,7 +272,7 @@ if __name__ == "__main__":
         ctrl.timings["release_s"] = args.recharge_ms / 1000.0
 
     try:
-        print("\n🔧 Testing the 4 Active Solenoids (1.0s recharge between each):")
+        print("\n🔧 Testing the 4 Active Solenoids at 45% Boost Duty (1.0s recharge between each):")
         for move in ["LEFT", "RIGHT", "ROTATE_CW", "ROTATE_CCW"]:
             print(f"  -> Striking {move} (BCM GPIO {BUTTON_PINS[move]})")
             ctrl.dispatch_sequence([move])
