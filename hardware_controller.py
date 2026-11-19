@@ -50,7 +50,7 @@ LED_MODE_TIMINGS = {
     "drop_hold_s": 0.35,
 }
 
-# Tuned for direct 12V supply: firm strikes + fast enough to finish 7-press moves before pieces land
+# Tuned for direct 12V supply: firm strikes + fast enough to finish multi-press moves before landing
 SOLENOID_MODE_TIMINGS = {
     "dpad_press_s": 0.080,             # 80ms firm strike for D-pad
     "rot_press_s": 0.075,              # 75ms firm strike for A / B buttons
@@ -138,6 +138,7 @@ class HardwareController:
         self.devices = {}
         self.boost_pwm = None
         self.last_action = None
+        self._busy = False
 
         if boost_duty_pct is None:
             boost_duty_pct = DEFAULT_BOOST_DUTY_PCT if boost_freq_hz <= 2000 else FAST_31KHZ_DUTY_PCT
@@ -168,6 +169,10 @@ class HardwareController:
 
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
+
+    def is_busy(self):
+        """Returns True while a solenoid sequence is actively firing or queued."""
+        return self._busy or not self.cmd_queue.empty()
 
     def _set_pin(self, action, state):
         if action not in BUTTON_PINS:
@@ -209,31 +214,34 @@ class HardwareController:
             except queue.Empty:
                 continue
 
-            for idx, action in enumerate(sequence):
-                if not self.running:
-                    break
-                if action == "DROP" and not ENABLE_DROP_SOLENOID:
-                    continue
+            self._busy = True
+            try:
+                for idx, action in enumerate(sequence):
+                    if not self.running:
+                        break
+                    if action == "DROP" and not ENABLE_DROP_SOLENOID:
+                        continue
 
-                if action in ("LEFT", "RIGHT"):
-                    hold_time = self.timings["dpad_press_s"]
-                elif action == "DROP":
-                    hold_time = self.timings["drop_hold_s"]
-                else:
-                    hold_time = self.timings["rot_press_s"]
+                    if action in ("LEFT", "RIGHT"):
+                        hold_time = self.timings["dpad_press_s"]
+                    elif action == "DROP":
+                        hold_time = self.timings["drop_hold_s"]
+                    else:
+                        hold_time = self.timings["rot_press_s"]
 
-                self._set_pin(action, True)
-                time.sleep(hold_time)
-                self._set_pin(action, False)
-                self.last_action = action
+                    self._set_pin(action, True)
+                    time.sleep(hold_time)
+                    self._set_pin(action, False)
+                    self.last_action = action
 
-                next_action = sequence[idx + 1] if idx + 1 < len(sequence) else None
-                wait_time = self.timings["release_s"]
-                if next_action == action:
-                    wait_time += self.timings.get("consecutive_same_extra_s", 0.040)
-                time.sleep(wait_time)
-
-            self.cmd_queue.task_done()
+                    next_action = sequence[idx + 1] if idx + 1 < len(sequence) else None
+                    wait_time = self.timings["release_s"]
+                    if next_action == action:
+                        wait_time += self.timings.get("consecutive_same_extra_s", 0.040)
+                    time.sleep(wait_time)
+            finally:
+                self._busy = False
+                self.cmd_queue.task_done()
 
     def cleanup(self):
         self.running = False
