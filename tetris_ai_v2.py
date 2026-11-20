@@ -1,39 +1,34 @@
 """
-tetris_ai_v2.py  --  Fast bitboard AI modeled on your winning tetris_brain.py
-
-- Keeps a flat 9-column stack and reserves EITHER Column 0 (left) or Column 9 (right)
-  as a clean 4-line Tetris well.
-- Uses your roof-penalized hole detector so it avoids creating or burying holes.
-- Automatically switches to survival/cleanup mode if the stack gets above row 8.
+tetris_ai_v2.py  --  Fast bitboard AI locked to a Column 9 Tetris well with strict hole avoidance.
 """
 from tetris_shapes import SHAPES, rotate_piece
 
 ROWS, COLS = 20, 10
 FULL = (1 << COLS) - 1
 
-# Safe mode: build flat 9-col stack + open left/right well for 4-line Tetrises
+# Safe mode: flat 9-col stack (Cols 0..8) + strictly open Col 9 for 4-line Tetrises
 W_DEFAULT = {
     'height': 0.35,
-    'holes': 32.0,          # Strongly avoids creating/burying holes
-    'bumpiness': 1.6,       # Keeps the 9 main columns flat with no internal canyons
-    'well_scale': 1.5,      # Rewards keeping Col 0 or Col 9 empty and deep
-    'lines_1': -22.0,       # Discourages single-line clears (unless needed to avoid a hole)
-    'lines_2': -6.0,
-    'lines_3': 18.0,
-    'lines_4': 450.0,       # Massive reward for 4-line Tetris!
+    'holes': 60.0,          # Heavy penalty so it avoids creating/burying holes
+    'bumpiness': 2.0,       # Keeps Cols 0..8 flat with no internal canyons
+    'well_scale': 3.5,      # Strong commitment to keeping Col 9 empty for I-bars
+    'lines_1': -30.0,       # Discourage single-line clears when stack is low
+    'lines_2': -8.0,
+    'lines_3': 20.0,
+    'lines_4': 600.0,       # Massive reward for 4-line Tetris!
     'move_cost': -0.002,
 }
 
 # Survival mode when any block reaches the top 8 rows
 W_HIGH_STACK = {
-    'height': 0.85,
-    'holes': 28.0,
-    'bumpiness': 1.4,
-    'well_scale': 0.0,      # Stop saving a well and just clear lines to survive
-    'lines_1': 28.0,
-    'lines_2': 65.0,
-    'lines_3': 130.0,
-    'lines_4': 450.0,
+    'height': 0.90,
+    'holes': 45.0,
+    'bumpiness': 1.5,
+    'well_scale': 0.0,      # Stop saving a well and clear lines to survive
+    'lines_1': 35.0,
+    'lines_2': 80.0,
+    'lines_3': 160.0,
+    'lines_4': 600.0,
     'move_cost': -0.002,
 }
 
@@ -116,53 +111,7 @@ def _clear(rows):
     return kept, n
 
 
-def _eval_side(heights, well_col, weights):
-    """Evaluates height, bumpiness, and well score assuming `well_col` (0 or 9) is the Tetris well."""
-    if well_col == 9:
-        main = heights[:-1]
-        adj_h = heights[8]
-    else:
-        main = heights[1:]
-        adj_h = heights[1]
-    well_h = heights[well_col]
-
-    # 1. Board height + tower span across the 9 main columns
-    tower_span = max(main) - min(main)
-    height_cost = sum(heights) + (max(heights) * 2.5) + (tower_span * 1.8)
-
-    # 2. Bumpiness + internal canyon penalties across the 9 main columns
-    bump = 0.0
-    for i in range(len(main) - 1):
-        diff = abs(main[i] - main[i + 1])
-        bump += diff * 1.75 if diff >= 2 else diff
-
-    for i in range(1, len(main) - 1):
-        wall_min = min(main[i - 1], main[i + 1])
-        if wall_min - main[i] >= 2:
-            bump += (wall_min - main[i]) * 1.5
-
-    if well_h > adj_h:
-        bump += (well_h - adj_h) * 4.0
-
-    # 3. Well bonus/penalty (only active when well_scale > 0)
-    well_score = 0.0
-    if weights['well_scale'] > 0.0:
-        avg_main = sum(main) / 9.0
-        min_main = min(main)
-        well_penalty = (-5.5 * well_h) if well_h > 0 else 3.5
-        true_depth = max(0.0, float(min_main - well_h))
-        dev_depth = max(0.0, avg_main - well_h) * 0.6
-        well_score = min(true_depth, 4.0) + min(dev_depth, 2.5) + well_penalty
-
-    return (
-        -(weights['height'] * height_cost)
-        - (weights['bumpiness'] * bump)
-        + (weights['well_scale'] * well_score)
-    )
-
-
 def _score_state(rows_after, lines_cleared, weights):
-    # Column heights + roof-penalized holes (from your original tetris_brain.py)
     heights = [0] * COLS
     total_holes = 0.0
 
@@ -177,10 +126,36 @@ def _score_state(rows_after, lines_cleared, weights):
                     block_found = True
                 blocks_above += 1
             elif block_found:
-                total_holes += 1.0 + (min(blocks_above, 5) * 0.20)
+                total_holes += 1.0 + (min(blocks_above, 5) * 0.25)
 
-    # Pick whichever side (left col 0 OR right col 9) gives the cleaner Tetris well
-    side_score = max(_eval_side(heights, 9, weights), _eval_side(heights, 0, weights))
+    # Strictly use Column 9 (rightmost) as the Tetris well
+    main = heights[:-1]
+    well_h = heights[9]
+
+    tower_span = max(main) - min(main)
+    height_cost = sum(heights) + (max(heights) * 2.5) + (tower_span * 1.8)
+
+    bump = 0.0
+    for i in range(8):
+        diff = abs(main[i] - main[i + 1])
+        bump += diff * 1.75 if diff >= 2 else diff
+
+    for i in range(1, 8):
+        wall_min = min(main[i - 1], main[i + 1])
+        if wall_min - main[i] >= 2:
+            bump += (wall_min - main[i]) * 1.5
+
+    if well_h > heights[8]:
+        bump += (well_h - heights[8]) * 4.0
+
+    well_score = 0.0
+    if weights['well_scale'] > 0.0:
+        avg_main = sum(main) / 9.0
+        min_main = min(main)
+        well_penalty = (-7.0 * well_h) if well_h > 0 else 4.0
+        true_depth = max(0.0, float(min_main - well_h))
+        dev_depth = max(0.0, avg_main - well_h) * 0.6
+        well_score = min(true_depth, 4.0) + min(dev_depth, 2.5) + well_penalty
 
     line_reward = 0.0
     if lines_cleared == 1:
@@ -192,7 +167,13 @@ def _score_state(rows_after, lines_cleared, weights):
     elif lines_cleared >= 4:
         line_reward = weights['lines_4']
 
-    return line_reward + side_score - (weights['holes'] * total_holes)
+    return (
+        line_reward
+        - (weights['height'] * height_cost)
+        - (weights['holes'] * total_holes)
+        - (weights['bumpiness'] * bump)
+        + (weights['well_scale'] * well_score)
+    )
 
 
 def _enumerate(rows, name, weights, with_cost=False):
