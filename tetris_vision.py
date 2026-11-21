@@ -353,7 +353,7 @@ class SpawnEvent:
 class SpawnTracker:
     """Turns a stream of occupancy grids into 'a new piece appeared' events."""
 
-    def __init__(self, confirm_s=0.10, min_confirm_frames=3, rearm_empty_s=0.06):
+    def __init__(self, confirm_s=0.10, min_confirm_frames=3, rearm_empty_s=0.15):
         self.confirm_s = confirm_s
         self.min_confirm_frames = min_confirm_frames
         self.rearm_empty_s = rearm_empty_s
@@ -387,7 +387,7 @@ class SpawnTracker:
 
     # cover thresholds tried, strictest first, when looking for a freshly spawned piece
     SPAWN_LEVELS = (0.85, 0.65, 0.50, 0.30)
-    ZONE_ROWS = 2      # spawn area that must be empty before a spawn can be detected (rows 0..ZONE_ROWS-1)
+    ZONE_ROWS = 4      # spawn area that must be empty before a spawn can be detected (rows 0..ZONE_ROWS-1)
     NEW_ROWS = 6       # rows searched for the 4 new cells
     MAX_R0 = 3         # highest row index the piece's top may be on when first seen
 
@@ -759,3 +759,5 @@ class VideoSource:
 
     def release(self):
         self.cap.release()
+
+
