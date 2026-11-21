@@ -142,11 +142,11 @@ class BoardObservation:
 class BoardReader:
     """Warps the playfield to an exact grid and decides which cells hold a block.
 
-    Tuned so dimmer / shaded palettes (like Level 3 & 7 yellow/brown blocks) are detected
-    cleanly alongside bright blue/purple blocks, while still rejecting dark background & white text.
+    Tuned for Level 3 & 7 yellow/brown palettes while rejecting blue-block glow
+    and ignoring white WAIT / LOSE / WIN! text when learning the empty background.
     """
 
-    def __init__(self, corners, cell=32, v_thr=100, cover_thr=0.55, margin=0.2, sat_min=55, adaptive=True):
+    def __init__(self, corners, cell=32, v_thr=112, cover_thr=0.68, margin=0.2, sat_min=65, adaptive=True):
         self.cell = cell
         self.warper = Warper(corners, BOARD_COLS * cell, BOARD_ROWS * cell)
         self.v_thr = float(v_thr)
@@ -163,11 +163,20 @@ class BoardReader:
         self.health = {"bg": 60.0, "ref": 220.0, "contrast": 160.0, "sat_min": self.sat_min}
 
     def learn_empty(self, frames):
+        """Learns the empty background while ignoring bright white text like WAIT / LOSE / WIN!"""
         p95 = np.zeros((BOARD_ROWS, BOARD_COLS), dtype=np.float32)
         for fr in frames:
             v4 = self._v4(self.warper(fr))
             cur = np.percentile(v4.transpose(0, 2, 1, 3).reshape(BOARD_ROWS, BOARD_COLS, -1), 95, axis=2)
             p95 = np.maximum(p95, cur)
+
+        # Mask out any bright text cells (e.g. white "WAIT" banner) and replace them with
+        # the median of the true dark empty-board cells.
+        dark = p95 < 120.0
+        if dark.any():
+            bg_med = float(np.median(p95[dark]))
+            p95 = np.where(dark, p95, bg_med)
+
         self.bg_v = p95.astype(np.float32)
         self.bg_init = True
         self._update_thr()
@@ -183,10 +192,9 @@ class BoardReader:
 
     def _update_thr(self):
         bg = self._bg_smooth()
-        # Sit closer to the dark background (0.30 instead of 0.55) so dimmer brown/yellow blocks
-        # aren't drowned out when bright blue/purple blocks are also on the board.
-        thr = bg + 0.30 * (self.ref_v - bg)
-        thr = np.clip(thr, np.maximum(bg + 28.0, 75.0), 165.0)
+        # 0.35 sits right between dark background + blue bloom and dimmer yellow/brown blocks
+        thr = bg + 0.35 * (self.ref_v - bg)
+        thr = np.clip(thr, np.maximum(bg + 35.0, 85.0), 175.0)
         thr = np.where(np.abs(thr - self.v_thr) <= 10.0, self.v_thr, thr)
         self.thr_map = thr.astype(np.float32)
 
@@ -195,7 +203,7 @@ class BoardReader:
             return
         p95 = np.percentile(v4.transpose(0, 2, 1, 3).reshape(BOARD_ROWS, BOARD_COLS, -1), 95, axis=2)
 
-        glare = (sat < 55) & (p95 > 100) & (std_v < 45)
+        glare = (sat < 60) & (p95 > 100) & (std_v < 45)
         crowd = cv2.boxFilter(glare.astype(np.float32), -1, (3, 3), normalize=False, borderType=cv2.BORDER_CONSTANT)
         glare &= crowd >= 4
         if glare.any():
@@ -217,11 +225,11 @@ class BoardReader:
             ref_now = float(np.percentile(vmean[grid], 25))
             self.ref_v = float(np.clip(0.9 * self.ref_v + 0.1 * ref_now, 100.0, 255.0))
             self.sat_ref = 0.9 * self.sat_ref + 0.1 * float(np.median(sat[grid]))
-            self.sat_min = float(np.clip(0.30 * self.sat_ref, 35.0, self.sat_min_default))
+            self.sat_min = float(np.clip(0.35 * self.sat_ref, 45.0, self.sat_min_default))
         else:
             peak_mask = v4 >= (p95[:, None, :, None] - 5.0)
             sat_peak = (s4 * peak_mask).sum(axis=(1, 3)) / np.maximum(peak_mask.sum(axis=(1, 3)), 1)
-            colourful = (sat_peak >= 0.30 * self.sat_ref) & ~glare
+            colourful = (sat_peak >= 0.35 * self.sat_ref) & ~glare
             if colourful.any():
                 peak = float(np.percentile(p95[colourful], 99))
                 if peak - bg > 35.0 and peak < self.ref_v - 25.0:
@@ -245,7 +253,7 @@ class BoardReader:
         grid = bright & (sat >= self.sat_min)
 
         std_v = v4.std(axis=(1, 3))
-        text_like = (cover >= 0.2) & (cover <= 0.92) & (sat < 50) & (std_v >= 40)
+        text_like = (cover >= 0.2) & (cover <= 0.92) & (sat < 60) & (std_v >= 40)
         banner = int(text_like[3:17, 1:9].sum()) >= 4
         if self.adaptive:
             self._adapt(v4, s4, cover, sat, grid, banner, std_v)
