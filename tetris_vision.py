@@ -142,18 +142,11 @@ class BoardObservation:
 class BoardReader:
     """Warps the playfield to an exact grid and decides which cells hold a block.
 
-    ADAPTIVE (adaptive=True, default): nothing is tied to one colour or one brightness.
-      bg_v   per-cell brightness of the EMPTY background, learned continuously from cells that are
-             quiet (no block, no neighbour lit) - follows room light, glare haze, exposure drift.
-      ref_v  brightness of the blocks currently on the board (dim / dark-palette levels read lower).
-      lit    = brighter than the midpoint between background and blocks
-      colour = the lit pixels must be colourful (saturation >= sat_min, itself scaled to the blocks'
-               own saturation), which rejects white text and white glare.
-    No hue is ever used, so purple / orange / any palette works as long as blocks are clearly
-    brighter than the background.  With default lighting the midpoint is ~140, same as before.
+    Tuned so dimmer / shaded palettes (like Level 3 & 7 yellow/brown blocks) are detected
+    cleanly alongside bright blue/purple blocks, while still rejecting dark background & white text.
     """
 
-    def __init__(self, corners, cell=32, v_thr=140, cover_thr=0.85, margin=0.2, sat_min=90, adaptive=True):
+    def __init__(self, corners, cell=32, v_thr=100, cover_thr=0.55, margin=0.2, sat_min=55, adaptive=True):
         self.cell = cell
         self.warper = Warper(corners, BOARD_COLS * cell, BOARD_ROWS * cell)
         self.v_thr = float(v_thr)
@@ -165,11 +158,10 @@ class BoardReader:
         self.bg_v = np.full((BOARD_ROWS, BOARD_COLS), 60.0, dtype=np.float32)
         self.bg_init = False
         self.ref_v = 220.0
-        self.sat_ref = 200.0
+        self.sat_ref = 180.0
         self.thr_map = np.full((BOARD_ROWS, BOARD_COLS), self.v_thr, dtype=np.float32)
         self.health = {"bg": 60.0, "ref": 220.0, "contrast": 160.0, "sat_min": self.sat_min}
 
-    # --- optional manual override (key 'b'): learn the background of an EMPTY board right now.
     def learn_empty(self, frames):
         p95 = np.zeros((BOARD_ROWS, BOARD_COLS), dtype=np.float32)
         for fr in frames:
@@ -186,18 +178,16 @@ class BoardReader:
         return v.reshape(BOARD_ROWS, c, BOARD_COLS, c)[:, m:c - m, :, m:c - m]
 
     def _bg_smooth(self):
-        """Glare and haze are SMOOTH over many cells; a bezel edge or a reflection on one cell is not.
-        So a cell's background may not be much brighter than the median of its 5x5 neighbourhood."""
         nb = cv2.medianBlur(self.bg_v.astype(np.float32), 5)
         return np.minimum(self.bg_v, nb + 25.0)
 
     def _update_thr(self):
         bg = self._bg_smooth()
-        thr = bg + 0.55 * (self.ref_v - bg)
-        thr = np.clip(thr, np.maximum(bg + 35.0, 55.0), 200.0)
-        # Near normal lighting use exactly the threshold that was tuned on real footage; the adaptive
-        # value only takes over when conditions genuinely differ (dim, hazy, glare, other palette).
-        thr = np.where(np.abs(thr - self.v_thr) <= 12.0, self.v_thr, thr)
+        # Sit closer to the dark background (0.30 instead of 0.55) so dimmer brown/yellow blocks
+        # aren't drowned out when bright blue/purple blocks are also on the board.
+        thr = bg + 0.30 * (self.ref_v - bg)
+        thr = np.clip(thr, np.maximum(bg + 28.0, 75.0), 165.0)
+        thr = np.where(np.abs(thr - self.v_thr) <= 10.0, self.v_thr, thr)
         self.thr_map = thr.astype(np.float32)
 
     def _adapt(self, v4, s4, cover, sat, grid, banner, std_v):
@@ -205,11 +195,7 @@ class BoardReader:
             return
         p95 = np.percentile(v4.transpose(0, 2, 1, 3).reshape(BOARD_ROWS, BOARD_COLS, -1), 95, axis=2)
 
-        # Glare / haze: bright but colourless and smooth.  It is background, so absorb it quickly
-        # (a block is never colourless).  This is what keeps a hot spot on the glass from being read
-        # as blocks or as a WAIT/LOSE banner.
-        glare = (sat < 70) & (p95 > 100) & (std_v < 45)
-        # ... and only where it is a smooth AREA (>= 4 of the 3x3 neighbourhood agree), not a lone bright cell
+        glare = (sat < 55) & (p95 > 100) & (std_v < 45)
         crowd = cv2.boxFilter(glare.astype(np.float32), -1, (3, 3), normalize=False, borderType=cv2.BORDER_CONSTANT)
         glare &= crowd >= 4
         if glare.any():
@@ -231,18 +217,14 @@ class BoardReader:
             ref_now = float(np.percentile(vmean[grid], 25))
             self.ref_v = float(np.clip(0.9 * self.ref_v + 0.1 * ref_now, 100.0, 255.0))
             self.sat_ref = 0.9 * self.sat_ref + 0.1 * float(np.median(sat[grid]))
-            self.sat_min = float(np.clip(0.45 * self.sat_ref, 45.0, self.sat_min_default))
+            self.sat_min = float(np.clip(0.30 * self.sat_ref, 35.0, self.sat_min_default))
         else:
-            # Nothing is detected as a block yet (very dim / dark palette?).  If something clearly
-            # brighter than the background and colourful exists, let the block level come DOWN to it.
-            # saturation measured at each cell's brightest pixels (not just at 'lit' pixels, of which
-            # there may be none yet when the picture is very dim)
             peak_mask = v4 >= (p95[:, None, :, None] - 5.0)
             sat_peak = (s4 * peak_mask).sum(axis=(1, 3)) / np.maximum(peak_mask.sum(axis=(1, 3)), 1)
-            colourful = (sat_peak >= 0.45 * self.sat_ref) & ~glare
+            colourful = (sat_peak >= 0.30 * self.sat_ref) & ~glare
             if colourful.any():
                 peak = float(np.percentile(p95[colourful], 99))
-                if peak - bg > 40.0 and peak < self.ref_v - 25.0:
+                if peak - bg > 35.0 and peak < self.ref_v - 25.0:
                     self.ref_v = float(np.clip(0.9 * self.ref_v + 0.1 * peak, 60.0, 255.0))
         self._update_thr()
         self.health = {"bg": bg, "ref": self.ref_v, "contrast": self.ref_v - bg, "sat_min": self.sat_min}
@@ -257,17 +239,13 @@ class BoardReader:
         thr = self.thr_map[:, None, :, None]
         lit = v4 > thr
         cover = lit.mean(axis=(1, 3))
-        # mean saturation of the LIT pixels: real blocks are strongly coloured,
-        # white text such as WAIT / LOSE / PAUSE and white glare are not.
         n_lit = np.maximum(lit.sum(axis=(1, 3)), 1)
         sat = (s4 * lit).sum(axis=(1, 3)) / n_lit
         bright = cover >= self.cover_thr
         grid = bright & (sat >= self.sat_min)
 
-        # Banner text (WAIT / LOSE / PAUSE) = several colourless cells with PARTIAL coverage and sharp
-        # strokes (high brightness variance inside the cell).  A glare spot is smooth, so it is not text.
         std_v = v4.std(axis=(1, 3))
-        text_like = (cover >= 0.2) & (cover <= 0.92) & (sat < 60) & (std_v >= 40)
+        text_like = (cover >= 0.2) & (cover <= 0.92) & (sat < 50) & (std_v >= 40)
         banner = int(text_like[3:17, 1:9].sum()) >= 4
         if self.adaptive:
             self._adapt(v4, s4, cover, sat, grid, banner, std_v)
