@@ -364,7 +364,7 @@ class SpawnTracker:
         return ((a.astype(np.uint8) + b + c) >= 2)      # 2-of-3 vote kills single-frame flicker
 
     # cover thresholds tried, strictest first, when looking for a freshly spawned piece
-    SPAWN_LEVELS = (0.85, 0.65, 0.50, 0.30)
+    SPAWN_LEVELS = (0.55, 0.45, 0.35, 0.25)
     ZONE_ROWS = 4      # spawn area that must be empty before a spawn can be detected (rows 0..ZONE_ROWS-1)
     NEW_ROWS = 6       # rows searched for the 4 new cells
     MAX_R0 = 3         # highest row index the piece's top may be on when first seen
