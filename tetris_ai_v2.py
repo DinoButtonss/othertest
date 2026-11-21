@@ -1,5 +1,6 @@
 """
-tetris_ai_v2.py  --  Fast bitboard AI locked to a Column 9 Tetris well with strict hole avoidance.
+tetris_ai_v2.py  --  Fast bitboard AI locked to a Column 9 Tetris well with strict hole avoidance,
+plus get_landing_row() and live fall-speed time budgeting for tetris_test.py.
 """
 from tetris_shapes import SHAPES, rotate_piece
 
@@ -111,6 +112,20 @@ def _clear(rows):
     return kept, n
 
 
+def get_landing_row(board, piece_name, rot, col):
+    """Returns the top landing row for (piece_name, rot, col), or -1 if invalid."""
+    if piece_name not in PIECES:
+        return -1
+    rows = board_to_rows(board)
+    for r_idx, h, w, masks in PIECES[piece_name]:
+        if r_idx == rot:
+            if col < 0 or col + w > COLS:
+                return -1
+            land_r, _ = _drop(rows, masks, h, col)
+            return land_r
+    return -1
+
+
 def _score_state(rows_after, lines_cleared, weights):
     heights = [0] * COLS
     total_holes = 0.0
@@ -192,7 +207,8 @@ def _enumerate(rows, name, weights, with_cost=False):
     return out
 
 
-def find_best_move(board, current_piece_name, next_piece_name=None, weights=None, beam_width=None):
+def find_best_move(board, current_piece_name, next_piece_name=None, weights=None,
+                   beam_width=None, press_fn=None, budget=None):
     if current_piece_name not in PIECES:
         return None, -999999, None
 
@@ -205,6 +221,27 @@ def find_best_move(board, current_piece_name, next_piece_name=None, weights=None
     stage1 = _enumerate(rows, current_piece_name, w, with_cost=True)
     if not stage1:
         return None, -999999, None
+
+    # Live fall-speed time budget filter (from tetris_test.py)
+    if press_fn is not None and budget is not None:
+        spr = budget.get('spr')
+        if spr:
+            elapsed = budget.get('elapsed', 0.0)
+            press_period = budget.get('press_period', 0.240)
+            strike = budget.get('strike', 0.080)
+            margin = budget.get('margin', 0.08)
+            feasible = []
+            for item in stage1:
+                rot, col = item[1]
+                n_press = press_fn(current_piece_name, rot, col)
+                need_s = (max(0, n_press - 1) * press_period + strike) if n_press > 0 else 0.0
+                land_r = get_landing_row(board, current_piece_name, rot, col)
+                avail_s = max(0.0, land_r * spr - elapsed - margin)
+                if need_s <= avail_s:
+                    feasible.append(item)
+            if feasible:
+                stage1 = feasible
+
     stage1.sort(key=lambda t: t[0], reverse=True)
 
     if next_piece_name not in PIECES:
